@@ -14,9 +14,9 @@ import (
 // ✅ 최근 50개 트랜잭션 중 Value가 2 이상인 것 찾기
 func FindHighValueTransactions(repo repository.TransactionRepository) {
 	pipeline := mongo.Pipeline{
-		{{"$sort", bson.D{{"block_number", -1}}}}, // 최신 블록 순 정렬
-		{{"$limit", 50}}, // 최근 50개 가져오기
-		{{"$match", bson.D{{"value", bson.D{{"$gte", 2}}}}}}, // value ≥ 2 필터
+		{{Key: "$sort", Value: bson.D{{Key: "block_number", Value: -1}}}},                        // 최신 블록 순 정렬
+		{{Key: "$limit", Value: 50}},                                                             // 최근 50개 가져오기
+		{{Key: "$match", Value: bson.D{{Key: "value", Value: bson.D{{Key: "$gte", Value: 2}}}}}}, // value ≥ 2 필터
 	}
 
 	results, err := repo.AggregateTransactions(context.TODO(), pipeline)

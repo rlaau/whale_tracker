@@ -4,6 +4,12 @@ import (
 	"encoding/hex"
 )
 
+func init() {
+	// 그냥 DB에서 깡으로 로드
+	// 가장 최신 기준
+	// PredifnedADddress
+}
+
 type Address [20]byte
 
 // ✅ 문자열 변환 (0x + hex encoding)
@@ -11,12 +17,31 @@ func (a Address) String() string {
 	return "0x" + hex.EncodeToString(a[:])
 }
 
+type PredefinedAddress interface {
+	MinerAddress |
+		CexHotWalletAddress | CexColdWalletAddress |
+		ERC20TokenAddress |
+		LendingPoolAddress | LendingStakingTokenAddress |
+		SwapLiquidityPoolAddress | LiquidityPoolStakingTokenAddress |
+		BeaconDepositAddress |
+		NFTContractAddress |
+		BridgeAddress
+}
+
+type DefinedOnProcess interface {
+	UserEOA | CexDepositAddress
+}
+
 type UserEOA Address // 사용자 계정 (외부 소유 지갑)
+
+type MinerAddress Address // 채굴자 주소 (마이닝 보상 수령 주소)
 
 // Centralized Exchange (CEX)
 type CexDepositAddress Address    // 거래소 입금주소 (사용자별 생성)
 type CexHotWalletAddress Address  // 거래소 운영용 지갑 (빠른 출금용)
 type CexColdWalletAddress Address // 거래소 장기 보관 지갑
+
+type ERC20TokenAddress Address // ERC-20 토큰 컨트랙트 주소
 
 // DeFi Lending/Staking 컨트랙트
 type LendingPoolAddress Address         // Aave 등 Lending Pool 주소
@@ -37,6 +62,7 @@ type BridgeAddress Address // Arbitrum, Optimism 등 브릿지 컨트랙트 주�
 
 type UndefinedAddress Address // 정의되지 않은 주소
 
+//! 다만 그럼에도 TokenAddress역시 중요함. 토큰에 tx시 토큰 transfer추적 가능
 // *(0) 사용자->사용자 Eth 전송
 // *(1) 사용자 → 사용자 토큰 전송
 //User(EOA) --ERC20 Token 전송호출--> Token Contract → 수신자 EOA
@@ -89,6 +115,8 @@ type UndefinedAddress Address // 정의되지 않은 주소
 // to: UserAddress
 // amount: LP Token 수량
 //
+
+//회수
 // {
 // 	"from": "UserAddress",
 // 	"to": "LiquidityPoolAddress",

@@ -1,10 +1,41 @@
 package database
 
 import (
+	"path/filepath"
 	"sync"
 
+	"cloud.google.com/go/bigquery"
+	"github.com/goccy/bigquery-emulator/server"
+	bigquery_mock "github.com/yuseferi/bigquery-mock"
 	"go.mongodb.org/mongo-driver/bson"
 )
+
+// ✅ BigQuery Mock 인터페이스 정의
+type MockPublicDataDB struct {
+	client *bigquery.Client
+}
+
+// ✅ MockPublicDataDB 생성자 (YAML 파일을 로드하여 BigQuery 모킹)
+func NewMockPublicDataDB(yamlPath string) (*MockPublicDataDB, error) {
+	bqClient, err := bigquery_mock.MockBigQuery("test_project", server.YAMLSource(filepath.Join(yamlPath)))
+	if err != nil {
+		return nil, err
+	}
+	return &MockPublicDataDB{client: bqClient}, nil
+}
+func (m *MockPublicDataDB) IsMock() bool {
+	return true
+}
+
+// ✅ `GetTable()` 모킹
+func (m *MockPublicDataDB) GetTable(name string) *bigquery.Table {
+	return m.client.Dataset("blockchain").Table(name)
+}
+
+// ✅ `Query()` 모킹 (BigQuery 쿼리 실행)
+func (m *MockPublicDataDB) Query(query string) *bigquery.Query {
+	return m.client.Query(query)
+}
 
 // ✅ MockMongoClient: 테스트용 MongoDB Mock
 type MockMongoClient struct {

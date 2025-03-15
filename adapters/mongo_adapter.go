@@ -9,7 +9,7 @@ import (
 type MongoTransaction struct {
 	TxID        string `bson:"tx_id"`
 	TxSyntax    string `bson:"tx_syntax"`
-	BlockNumber uint64 `bson:"block_number"`
+	BlockNumber int64  `bson:"block_number"`
 	From        string `bson:"from"`
 	To          string `bson:"to"`
 	Value       string `bson:"value"`

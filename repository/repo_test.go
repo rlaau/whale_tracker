@@ -3,18 +3,72 @@ package repository_test
 import (
 	"context"
 	"encoding/hex"
+	"log"
 	"math/big"
+	"os"
+	"path/filepath"
 	"testing"
 
 	// 프로젝트 패키지
 	"whale_tracker/adapters"
+	"whale_tracker/database"
 	"whale_tracker/primitives"
 	"whale_tracker/repository"
 
+	"github.com/joho/godotenv"
+
 	// mtest 관련
+	"github.com/stretchr/testify/assert"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo/integration/mtest"
+	//go 모킹 관련
 )
+
+func TestGetLatestTransactions_FilterByValue(t *testing.T) {
+	// ✅ Mock BigQuery 클라이언트 생성 (YAML 기반 데이터 로드)
+	err := godotenv.Load("/home/rlaaudgjs5638/whale_tracker/.env.local") // <-- .env.local을 명시적으로 로드
+	if err != nil {
+		log.Fatal("Error loading .env.local file:", err)
+	}
+
+	// 환경 변수 가져오기
+	projectRoot := os.Getenv("GO_PROJECT_ROOT")
+	if projectRoot == "" {
+		log.Fatal("환경 변수 GO_PROJECT_ROOT가 설정되지 않았습니다.")
+	}
+
+	mockDB, err := database.NewMockPublicDataDB(filepath.Join(projectRoot, "testdata", "publicdata_mock.yaml"))
+	if err != nil {
+		t.Fatalf("Failed to create mock BigQuery: %v", err)
+	}
+
+	// ✅ 저장소 인스턴스 생성
+	repo := repository.NewPublicDataTransactionRepository(mockDB)
+
+	// ✅ 테스트 실행
+	ctx := context.Background()
+	transactions, err := repo.GetLatestTransactions(ctx)
+
+	// ✅ 에러 없음 확인
+	assert.NoError(t, err)
+	assert.Len(t, transactions, 2) // ✅ `value >= 1000`인 데이터만 남아야 함
+
+	// ✅ 필터링된 트랜잭션 값 확인 (순서 무관하게 포함 여부만 확인)
+	values := map[string]bool{
+		primitives.NewBigInt("1200").String(): false,
+		primitives.NewBigInt("1500").String(): false,
+	}
+
+	// ✅ 트랜잭션 목록을 순회하면서 값이 존재하는지 확인
+	for _, tx := range transactions {
+		if _, exists := values[tx.Value.String()]; exists {
+			values[tx.Value.String()] = true
+		}
+	}
+
+	// ✅ 최소 하나의 1200 또는 1500 값이 있는지 확인
+	assert.True(t, values[primitives.NewBigInt("1200").String()] && values[primitives.NewBigInt("1500").String()])
+}
 
 // ✅ 단일 Insert 테스트
 func TestMongoTransactionRepository_InsertTransaction(t *testing.T) {
@@ -64,27 +118,6 @@ func TestMongoTransactionRepository_InsertTransaction(t *testing.T) {
 	})
 }
 
-// ✅ 테스트용 샘플 데이터 생성
-func newTestTransaction(i int) primitives.Transaction {
-	tx := primitives.Transaction{}
-
-	// 32바이트 TxID
-	copy(tx.TxID[:], hexDecode("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"))
-
-	tx.TxSyntax = "TxUser2UserEthTransfer"
-	tx.BlockNumber = uint64(i)
-
-	// 20바이트 주소 (From, To)
-	copy(tx.From[:], hexDecode("1122334455667788990011223344556677889900"))
-	copy(tx.To[:], hexDecode("9988776655443322110099887766554433221100"))
-
-	tx.Value = primitives.NewBigInt("1000000000000000000") // 1 ETH (Wei 단위)
-	tx.GasLimit = primitives.NewBigInt("21000")
-	tx.Input = "0xabcdef"
-
-	return tx
-}
-
 // ✅ 헥스 문자열을 바이트 배열로 변환하는 유틸 함수
 func hexDecode(s string) []byte {
 	data, _ := hex.DecodeString(s)
@@ -106,12 +139,12 @@ func TestMongoTransactionRepository_FindTransactions(t *testing.T) {
 		}
 		// (1) 가짜 문서 데이터 (Cursor가 반환할 값)
 		var txID1, txID2 [32]byte
-		copy(txID1[:], hexDecode("aa"))
+		copy(txID1[:], hexDecode("0xaa"))
 		copy(txID2[:], hexDecode("bb"))
 
 		var from1, from2 [20]byte
-		copy(from1[:], "0xFROM1")
-		copy(from2[:], "0xFROM2")
+		copy(from1[:], hexDecode("0xFROM1"))
+		copy(from2[:], hexDecode("0xFROM2"))
 
 		var to1, to2 [20]byte
 		copy(to1[:], "0xTO1")

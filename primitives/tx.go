@@ -9,7 +9,7 @@ import (
 type Transaction struct {
 	TxID        TxId
 	TxSyntax    string
-	BlockNumber uint64
+	BlockNumber int64
 	From        Address
 	To          Address
 	Value       BigInt
@@ -60,6 +60,15 @@ func (b *BigInt) SetString(value string, base int) {
 		b.Int = new(big.Int)
 	}
 	b.Int.SetString(value, base)
+}
+
+// ✅ Cmp 메서드 추가 (비교 연산 지원)
+// -1(other가 더 큼), 0, 1(b가 더 큼) 중하나로 부등연산 결과 리턴.
+func (b BigInt) Cmp(other BigInt) int {
+	if b.Int == nil || other.Int == nil {
+		return -1 // 비교할 값이 없으면 작은 값으로 간주
+	}
+	return b.Int.Cmp(other.Int)
 }
 
 type BlockNumber uint64

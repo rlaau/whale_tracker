@@ -16,8 +16,8 @@ type MongoDB interface {
 
 // 싱글톤 인스턴스 및 동기화 객체
 var (
-	once     sync.Once
-	instance *MongoClient
+	mongoOnce     sync.Once
+	mongoInstance *MongoClient
 )
 
 // ✅ 싱글톤 MongoDB 클라이언트 구조체
@@ -27,15 +27,15 @@ type MongoClient struct {
 
 // ✅ 싱글톤 인스턴스 반환
 func GetMongoInstance() MongoDB {
-	once.Do(func() {
+	mongoOnce.Do(func() {
 		clientOptions := options.Client().ApplyURI("mongodb://localhost:27017")
 		client, err := mongo.Connect(context.TODO(), clientOptions)
 		if err != nil {
 			log.Fatal(err)
 		}
-		instance = &MongoClient{client: client}
+		mongoInstance = &MongoClient{client: client}
 	})
-	return instance
+	return mongoInstance
 }
 
 // ✅ 다중 컬렉션 지원 (트랜잭션, 유저, 엔티티 등)

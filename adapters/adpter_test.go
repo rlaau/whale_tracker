@@ -22,7 +22,7 @@ func newTestTransaction() primitives.Transaction {
 
 	// 20바이트 주소 (From, To)
 	copy(tx.From[:], hexDecode("1122334457889900"))
-	copy(tx.To[:], hexDecode("998877663221100"))
+	copy(tx.To[:], hexDecode("0x998877663221100"))
 	tx.Value = primitives.NewBigInt("1000000000000000000") // 1 ETH (Wei 단위)
 	tx.GasLimit = primitives.NewBigInt("21000")
 	tx.Input = "0xabcdef"

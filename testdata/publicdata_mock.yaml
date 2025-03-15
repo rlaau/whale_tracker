@@ -1,0 +1,43 @@
+projects:
+  - id: test_project
+    datasets:
+      - id: blockchain
+        tables:
+          - id: transactions
+            columns:
+              - name: transaction_hash
+                type: STRING
+              - name: block_number
+                type: INTEGER
+              - name: from_address
+                type: STRING
+              - name: to_address
+                type: STRING
+              - name: value
+                type: STRING
+              - name: gas_limit
+                type: STRING
+              - name: input
+                type: STRING
+            data:
+              - transaction_hash: "0xabc"
+                block_number: 12345
+                from_address: "0xfrom1"
+                to_address: "0xto1"
+                value: "1200"
+                gas_limit: "21000"
+                input: "input1"
+              - transaction_hash: "0xdef"
+                block_number: 12346
+                from_address: "0xfrom2"
+                to_address: "0xto2"
+                value: "800"
+                gas_limit: "22000"
+                input: "input2"
+              - transaction_hash: "0xghi"
+                block_number: 12347
+                from_address: "0xfrom3"
+                to_address: "0xto3"
+                value: "1500"
+                gas_limit: "23000"
+                input: "input3"
