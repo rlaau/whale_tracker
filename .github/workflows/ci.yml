@@ -1,0 +1,68 @@
+name: Go CI (BigQuery Mock Test)
+
+on:
+  push:
+    branches:
+      - main # ✅ main 브랜치에 push 시 실행
+  pull_request:
+    branches:
+      - main # ✅ main 브랜치로 PR 발생 시 실행
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ✅ 1. 저장소 체크아웃
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ✅ 2. Go 설치 (버전 지정)
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: 1.21 # ✅ 사용 중인 Go 버전에 맞춤
+
+      # ✅ 3. Go 패키지 캐싱 (빌드 속도 최적화)
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      # ✅ 4. 의존성 설치 (오래 걸리는 패키지는 미리 `go install`)
+      - name: Install dependencies
+        run: |
+          go mod tidy
+          go mod download
+          go install ./...  # ✅ 미리 설치하여 속도 최적화
+
+      # ✅ 5. 환경 변수 설정 (BigQuery 모킹을 위한 설정)
+      - name: Set environment variables
+        run: |
+          echo "CGO_ENABLED=1" >> $GITHUB_ENV
+          echo "CXX=clang++" >> $GITHUB_ENV
+
+      # ✅ 6. 코드 빌드
+      - name: Build
+        run: go build ./...
+
+      # ✅ 7. 모든 테스트 실행 + 코드 커버리지 측정
+      - name: Run tests with coverage
+        run: go test ./... -coverprofile=coverage.out -v
+
+      # ✅ 8. 코드 커버리지 출력
+      - name: Show coverage result
+        run: go tool cover -func=coverage.out
+
+      # ✅ 9. 코드 커버리지 리포트 업로드 (선택 사항)
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v3
+        with:
+          file: coverage.out
+          flags: unittests
+          name: codecov-go
