@@ -2,30 +2,13 @@ package primitives
 
 import (
 	"encoding/hex"
-	"encoding/json"
 )
 
 type Address [20]byte
 
+// ✅ 문자열 변환 (0x + hex encoding)
 func (a Address) String() string {
 	return "0x" + hex.EncodeToString(a[:])
-}
-
-func (a Address) MarshalJSON() ([]byte, error) {
-	return json.Marshal(a.String())
-}
-
-func (a *Address) UnmarshalJSON(data []byte) error {
-	var hexStr string
-	if err := json.Unmarshal(data, &hexStr); err != nil {
-		return err
-	}
-	bytes, err := hex.DecodeString(hexStr[2:]) // "0x" 제거
-	if err != nil {
-		return err
-	}
-	copy(a[:], bytes)
-	return nil
 }
 
 type UserEOA Address // 사용자 계정 (외부 소유 지갑)

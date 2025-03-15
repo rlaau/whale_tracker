@@ -2,52 +2,64 @@ package primitives
 
 import (
 	"encoding/hex"
-	"encoding/json"
 	"math/big"
 )
 
+// 트랜잭션 구조체
+type Transaction struct {
+	TxID        TxId
+	TxSyntax    string
+	BlockNumber uint64
+	From        Address
+	To          Address
+	Value       BigInt
+	GasLimit    BigInt
+	Input       string
+}
+
+// TX 원시 데이터
+// {
+// 	"hash": "0x...",       // 트랜잭션 해시
+// 	"from": "0xSender",    // 발신 주소
+// 	"to": "0xRecipient",   // 수신 주소 (EOA or CA)
+// 	"value": "0",          // 전송 ETH 양
+// 	"gas": 21000,          // 가스 제한
+// 	"gasPrice": "50 Gwei", // 가스 가격
+// 	"input": "0x..."       // 호출 데이터 (ABI encoded data)(함수 시그니처 및 파라미터)
+// Eth전송만 할 시엔 input값이 없음. (물론, 스테이킹 시도 이더 전송 취급이라, 이걸 바탕으로 신택스 확정은 불가)
+//   }
+
 type TxId [32]byte
 
+// ✅ 문자열 변환 (0x + hex encoding)
 func (t TxId) String() string {
 	return "0x" + hex.EncodeToString(t[:])
 }
 
-func (t TxId) MarshalJSON() ([]byte, error) {
-	return json.Marshal(t.String())
-}
-
-func (t *TxId) UnmarshalJSON(data []byte) error {
-	var hexStr string
-	if err := json.Unmarshal(data, &hexStr); err != nil {
-		return err
-	}
-	bytes, err := hex.DecodeString(hexStr[2:]) // "0x" 제거
-	if err != nil {
-		return err
-	}
-	copy(t[:], bytes)
-	return nil
-}
-
 // ✅ BigInt 변환 (MongoDB & BigQuery 호환)
 type BigInt struct {
-	*big.Int
+	Int *big.Int
 }
 
-// ✅ JSON 변환 (BigInt → string)
-func (b BigInt) MarshalJSON() ([]byte, error) {
-	return json.Marshal(b.String())
+// ✅ BigInt 생성자 함수
+func NewBigInt(value string) BigInt {
+	b := new(big.Int)
+	b.SetString(value, 10)
+	return BigInt{Int: b}
 }
 
-// ✅ JSON 복구 (string → BigInt)
-func (b *BigInt) UnmarshalJSON(data []byte) error {
-	var str string
-	if err := json.Unmarshal(data, &str); err != nil {
-		return err
+// ✅ 문자열 변환 (MongoDB & BigQuery에서 사용)
+func (b BigInt) String() string {
+	if b.Int == nil {
+		return "0"
 	}
-	b.Int = new(big.Int)
-	b.Int.SetString(str, 10) // 10진수 변환
-	return nil
+	return b.Int.String()
+}
+func (b *BigInt) SetString(value string, base int) {
+	if b.Int == nil {
+		b.Int = new(big.Int)
+	}
+	b.Int.SetString(value, base)
 }
 
 type BlockNumber uint64
@@ -84,27 +96,3 @@ const (
 	TxUndefined // 정의되지 않은 트랜잭션
 
 )
-
-// TX 원시 데이터
-// {
-// 	"hash": "0x...",       // 트랜잭션 해시
-// 	"from": "0xSender",    // 발신 주소
-// 	"to": "0xRecipient",   // 수신 주소 (EOA or CA)
-// 	"value": "0",          // 전송 ETH 양
-// 	"gas": 21000,          // 가스 제한
-// 	"gasPrice": "50 Gwei", // 가스 가격
-// 	"input": "0x..."       // 호출 데이터 (ABI encoded data)(함수 시그니처 및 파라미터)
-// Eth전송만 할 시엔 input값이 없음. (물론, 스테이킹 시도 이더 전송 취급이라, 이걸 바탕으로 신택스 확정은 불가)
-//   }
-
-// ✅ 트랜잭션 구조체 (MongoDB & BigQuery 호환)
-type Transaction struct {
-	TxID        TxId    `bson:"tx_id" bigquery:"tx_id"`
-	TxSyntax    string  `bson:"tx_syntax" bigquery:"tx_syntax"`
-	BlockNumber uint64  `bson:"block_number" bigquery:"block_number"`
-	From        Address `bson:"from" bigquery:"from"`
-	To          Address `bson:"to" bigquery:"to"`
-	Value       BigInt  `bson:"value" bigquery:"value"`
-	GasLimit    BigInt  `bson:"gas_limit" bigquery:"gas_limit"`
-	Input       string  `bson:"input" bigquery:"input"`
-}
