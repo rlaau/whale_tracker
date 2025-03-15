@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"log"
 	"math/big"
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -14,8 +13,6 @@ import (
 	"whale_tracker/database"
 	"whale_tracker/primitives"
 	"whale_tracker/repository"
-
-	"github.com/joho/godotenv"
 
 	// mtest 관련
 	"github.com/stretchr/testify/assert"
@@ -26,13 +23,10 @@ import (
 
 func TestGetLatestTransactions_FilterByValue(t *testing.T) {
 	// ✅ Mock BigQuery 클라이언트 생성 (YAML 기반 데이터 로드)
-	err := godotenv.Load("/home/rlaaudgjs5638/whale_tracker/.env.local") // <-- .env.local을 명시적으로 로드
-	if err != nil {
-		log.Fatal("Error loading .env.local file:", err)
-	}
+	// ✅ 환경 변수 로드
 
 	// 환경 변수 가져오기
-	projectRoot := os.Getenv("GO_PROJECT_ROOT")
+	projectRoot := primitives.GetProjectRoot()
 	if projectRoot == "" {
 		log.Fatal("환경 변수 GO_PROJECT_ROOT가 설정되지 않았습니다.")
 	}

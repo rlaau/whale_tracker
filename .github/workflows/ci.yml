@@ -1,4 +1,4 @@
-name: Go CI (BigQuery Mock Test)
+name: Go CI (Whale Tracker)
 
 on:
   push:
@@ -16,46 +16,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies (GCC, Clang)
-        run: |
-          sudo apt update
-          sudo apt install -y g++-12 gcc-12 clang make
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
 
-      - name: Set up Go
-        uses: actions/setup-go@v4
-        with:
-          go-version: 1.21
+      - name: Build Docker Test Image
+        run: docker buildx build -t whale_tracker-test -f docker/Dockerfile.test --load .
 
-      - name: Set environment variables
-        run: |
-          echo "CGO_ENABLED=1" >> $GITHUB_ENV
-          echo "CC=gcc-12" >> $GITHUB_ENV
-          echo "CXX=g++-12" >> $GITHUB_ENV
-          echo "CXXFLAGS=-Wno-macro-redefined -Wno-unknown-warning-option" >> $GITHUB_ENV
-          echo "CGO_LDFLAGS=-Wl,--allow-multiple-definition" >> $GITHUB_ENV
+      - name: Run Tests in Docker
+        run: docker run --rm whale_tracker-test
 
-      - name: Cache Go modules
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
-      - name: Install Go dependencies
-        run: |
-          go mod tidy
-          go mod download
-          go install ./...
-
-      - name: Build
-        run: |
-          CGO_LDFLAGS="-Wl,--allow-multiple-definition" go build ./...
-
-      - name: Run tests
-        run: go test ./... -coverprofile=coverage.out -v
-
-      - name: Show coverage result
-        run: go tool cover -func=coverage.out
+      - name: Show Coverage Report
+        run: docker run --rm whale_tracker-test go tool cover -func=coverage.out
