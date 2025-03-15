@@ -24,6 +24,3 @@ jobs:
 
       - name: Run Tests in Docker
         run: docker run --rm whale_tracker-test
-
-      - name: Show Coverage Report
-        run: docker run --rm whale_tracker-test go tool cover -func=coverage.out
