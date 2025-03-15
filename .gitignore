@@ -1,11 +1,11 @@
 # Ignore environment variable files
 .env
-.env.*
-!.env.example  # 예제 파일은 유지
-.env.local
+.env.local  # ✅ 반드시 개별적으로 지정하여 무시
 .env.production
 .env.development
 .env.staging
+.env.*  # ✅ 이 항목을 가장 마지막에 배치
+!.env.example  # ✅ 예제 파일은 유지
 
 # Ignore log files
 *.log
