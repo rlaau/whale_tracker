@@ -1,8 +1,34 @@
 package primitives
 
+import (
+	"encoding/hex"
+	"encoding/json"
+)
+
 type Address [20]byte
 
-type EOA Address // 사용자 계정 (외부 소유 지갑)
+func (a Address) String() string {
+	return "0x" + hex.EncodeToString(a[:])
+}
+
+func (a Address) MarshalJSON() ([]byte, error) {
+	return json.Marshal(a.String())
+}
+
+func (a *Address) UnmarshalJSON(data []byte) error {
+	var hexStr string
+	if err := json.Unmarshal(data, &hexStr); err != nil {
+		return err
+	}
+	bytes, err := hex.DecodeString(hexStr[2:]) // "0x" 제거
+	if err != nil {
+		return err
+	}
+	copy(a[:], bytes)
+	return nil
+}
+
+type UserEOA Address // 사용자 계정 (외부 소유 지갑)
 
 // Centralized Exchange (CEX)
 type CexDepositAddress Address    // 거래소 입금주소 (사용자별 생성)
@@ -10,22 +36,23 @@ type CexHotWalletAddress Address  // 거래소 운영용 지갑 (빠른 출금�
 type CexColdWalletAddress Address // 거래소 장기 보관 지갑
 
 // DeFi Lending/Staking 컨트랙트
-type LendingPoolAddress Address                 // Aave 등 Lending Pool 주소
-type LendingStakingTokenContractAddress Address // Lending 예치 후 지급되는 이자토큰 (예: aETH, cETH 등)
+type LendingPoolAddress Address         // Aave 등 Lending Pool 주소
+type LendingStakingTokenAddress Address // Lending 예치 후 지급되는 이자토큰 (예: aETH, cETH 등)
 
 // DeFi Swap 관련 컨트랙트
-type SwapContractAddress Address // Uniswap, SushiSwap 등 AMM 컨트랙트 주소
-type SwapLpTokenAddress Address  // LP토큰 컨트랙트 주소 (Uniswap LP토큰 등)
+type SwapLiquidityPoolAddress Address         // Uniswap, SushiSwap 등 AMM 컨트랙트 주소
+type LiquidityPoolStakingTokenAddress Address // LP토큰 컨트랙트 주소 (Uniswap LP토큰 등)
 
 // ETH 2.0 (Beacon Chain)
-type BeaconDepositContractAddress Address // ETH2.0 스테이킹 주소
+type BeaconDepositAddress Address // ETH2.0 스테이킹 주소
 
 // NFT 관련
-type NftContractAddress Address // ERC-721, ERC-1155 컨트랙트 주소
+type NFTContractAddress Address // ERC-721, ERC-1155 컨트랙트 주소
 
 // Bridge 관련
-type BridgeContractAddress Address // Arbitrum, Optimism 등 브릿지 컨트랙트 주소
+type BridgeAddress Address // Arbitrum, Optimism 등 브릿지 컨트랙트 주소
 
+type UndefinedAddress Address // 정의되지 않은 주소
 
 // *(0) 사용자->사용자 Eth 전송
 // *(1) 사용자 → 사용자 토큰 전송

@@ -1,8 +1,55 @@
 package primitives
 
-import "math/big"
+import (
+	"encoding/hex"
+	"encoding/json"
+	"math/big"
+)
 
 type TxId [32]byte
+
+func (t TxId) String() string {
+	return "0x" + hex.EncodeToString(t[:])
+}
+
+func (t TxId) MarshalJSON() ([]byte, error) {
+	return json.Marshal(t.String())
+}
+
+func (t *TxId) UnmarshalJSON(data []byte) error {
+	var hexStr string
+	if err := json.Unmarshal(data, &hexStr); err != nil {
+		return err
+	}
+	bytes, err := hex.DecodeString(hexStr[2:]) // "0x" 제거
+	if err != nil {
+		return err
+	}
+	copy(t[:], bytes)
+	return nil
+}
+
+// ✅ BigInt 변환 (MongoDB & BigQuery 호환)
+type BigInt struct {
+	*big.Int
+}
+
+// ✅ JSON 변환 (BigInt → string)
+func (b BigInt) MarshalJSON() ([]byte, error) {
+	return json.Marshal(b.String())
+}
+
+// ✅ JSON 복구 (string → BigInt)
+func (b *BigInt) UnmarshalJSON(data []byte) error {
+	var str string
+	if err := json.Unmarshal(data, &str); err != nil {
+		return err
+	}
+	b.Int = new(big.Int)
+	b.Int.SetString(str, 10) // 10진수 변환
+	return nil
+}
+
 type BlockNumber uint64
 
 type TxSyntax uint8
@@ -34,6 +81,8 @@ const (
 	TxCexDeposit2User         // 거래소 예치계좌->사용자 출금
 	TxCexDeposit2CexHotWallet // 거래소 예치계좌->거래소 핫월렛
 
+	TxUndefined // 정의되지 않은 트랜잭션
+
 )
 
 // TX 원시 데이터
@@ -48,25 +97,14 @@ const (
 // Eth전송만 할 시엔 input값이 없음. (물론, 스테이킹 시도 이더 전송 취급이라, 이걸 바탕으로 신택스 확정은 불가)
 //   }
 
-// 트랜잭션 리시트 구조체
+// ✅ 트랜잭션 구조체 (MongoDB & BigQuery 호환)
 type Transaction struct {
-	TxID        TxId // 트랜잭션 해시
-	TxSyntax    TxSyntax
-	BlockNumber BlockNumber // 포함된 블록 번호
-
-	From     Address // 보낸 주소
-	To       Address // 받는 주소
-	Value    big.Int // 전송된 ETH (wei 단위)
-	GasLimit big.Int // 가스 제한
-
-	//From->To에 대한 설명 및 그 부수효과
-	//Eth전송은 부수효과가 없음-> 로그 없음
-	//토큰 전송의 경우 각종 부수효과 기록됨
-	//즉, 토큰 전송의 경우
-	//From User, TO TokenContract가 끝인데
-	//그 부수효과로
-	// Transfer(user,recepient,amount) 이벤트가 발생
-	//이 이벤트는 로그에 기록됨
-	input string // 입력 데이터
-
+	TxID        TxId    `bson:"tx_id" bigquery:"tx_id"`
+	TxSyntax    string  `bson:"tx_syntax" bigquery:"tx_syntax"`
+	BlockNumber uint64  `bson:"block_number" bigquery:"block_number"`
+	From        Address `bson:"from" bigquery:"from"`
+	To          Address `bson:"to" bigquery:"to"`
+	Value       BigInt  `bson:"value" bigquery:"value"`
+	GasLimit    BigInt  `bson:"gas_limit" bigquery:"gas_limit"`
+	Input       string  `bson:"input" bigquery:"input"`
 }

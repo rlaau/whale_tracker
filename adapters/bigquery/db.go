@@ -1,4 +1,4 @@
-package bigquery
+package publicdata
 
 import (
 	"context"
