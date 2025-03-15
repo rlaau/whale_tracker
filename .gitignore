@@ -1,6 +1,6 @@
 # Ignore environment variable files
 .env
-.env.local  # ✅ 반드시 개별적으로 지정하여 무시
+.env.local  
 .env.production
 .env.development
 .env.staging
