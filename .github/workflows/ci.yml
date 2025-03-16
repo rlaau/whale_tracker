@@ -1,4 +1,4 @@
-name: Automatic Testing CI (Whale Tracker)
+name: Go CI (Whale Tracker)
 
 on:
   push:
@@ -20,15 +20,33 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
-      # ✅ Docker Buildx 캐시 활용 최적화 (빌드 시간 단축)
+      # ✅ Docker Buildx 캐시 복원 (GitHub Actions 캐시 활용)
+      - name: Restore Docker Cache
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: buildx-cache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            buildx-cache-${{ runner.os }}-
+
+      # ✅ Docker Buildx 캐시 활용하여 빌드
       - name: Build Docker Test Image (with Cache)
         run: |
           docker buildx build \
             --cache-from=type=local,src=/tmp/.buildx-cache \
-            --cache-to=type=local,dest=/tmp/.buildx-cache \
+            --cache-to=type=local,dest=/tmp/.buildx-cache,mode=max \
             -t whale_tracker-test \
             -f docker/Dockerfile.test \
             --load .
+
+      # ✅ Docker 캐시 저장
+      - name: Save Docker Cache
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: buildx-cache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            buildx-cache-${{ runner.os }}-
 
       # ✅ 테스트 실행 (커버리지 포함)
       - name: Run Tests in Docker
