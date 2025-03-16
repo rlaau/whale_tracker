@@ -1,4 +1,4 @@
-name: Go Automatic Test CI (Whale Tracker)
+name: Go CI (Whale Tracker)
 
 on:
   push:
@@ -16,11 +16,33 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ✅ Docker Buildx 설정 (빌드 속도 향상)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
+      # ✅ 캐시를 활용한 Docker 빌드 속도 개선
       - name: Build Docker Test Image
-        run: docker buildx build -t whale_tracker-test -f docker/Dockerfile.test --load .
+        run: |
+          docker buildx build \
+            --cache-from=type=gha \
+            --cache-to=type=gha,mode=max \
+            -t whale_tracker-test \
+            -f docker/Dockerfile.test \
+            --load .
 
+      # ✅ 테스트 실행 (커버리지 포함)
       - name: Run Tests in Docker
-        run: docker run --rm whale_tracker-test
+        run: |
+          docker run --rm whale_tracker-test
+          docker cp $(docker create --rm whale_tracker-test):/app/coverage.out ./coverage.out || true
+
+      # ✅ 테스트 커버리지 결과 출력
+      - name: Show Coverage Results
+        run: go tool cover -func=coverage.out || echo "No coverage report found"
+
+      # ✅ 테스트 커버리지 아티팩트 저장
+      - name: Upload Coverage Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: coverage.out
