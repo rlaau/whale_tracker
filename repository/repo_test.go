@@ -75,6 +75,7 @@ func TestMongoTransactionRepository_InsertTransaction(t *testing.T) {
 			t.Fatal("mt.Coll is nil, mtest initialization failed")
 		}
 
+		println("두번째!!")
 		// 🔹 Repository 인스턴스에 가짜 Collection 주입
 		testRepo := &repository.MongoTransactionRepository{
 			Collection: mt.Coll, // mt.Coll을 직접 사용해야 함

@@ -1,15 +1,12 @@
-# ✅ 1. Go 테스트용 스테이지
-FROM golang:1.23.7 AS test
+# ✅ 1. 의존성 사전 컴파일 스테이지 (무거운 의존성만)
+FROM golang:1.23.7 AS deps-prebuild
 
-# ✅ 2. 필수 패키지 설치
 RUN apt update && apt install -y \
     g++-12 gcc-12 clang make zsh curl \
     && rm -rf /var/lib/apt/lists/*
 
-# ✅ 3. 작업 디렉토리 설정
 WORKDIR /app
 
-# ✅ 4. Go 환경 변수 설정
 ENV GOPATH=/root/go \
     GOROOT=/usr/local/go \
     GOBIN=/root/go/bin \
@@ -18,17 +15,68 @@ ENV GOPATH=/root/go \
     CC=gcc \
     CXX=clang++ \
     CXXFLAGS="-Wno-macro-redefined -Wno-unknown-warning-option" \
-    CGO_LDFLAGS="-Wl,--allow-multiple-definition"
+    CGO_LDFLAGS="-Wl,--allow-multiple-definition" \
+    GOMODCACHE=/root/go/pkg/mod \
+    GOCACHE=/root/.cache/go-build
 
-# ✅ 5. Go 모듈 파일 복사 및 의존성 설치
+# ✅ go.mod, go.sum 먼저 복사하여 의존성 캐싱 활용
 COPY go.mod go.sum ./
 RUN go mod tidy && go mod download
+RUN go mod verify
 
-# ✅ 6. 프로젝트 코드 복사
-COPY . .
+# ✅ 누락된 패키지들을 명시적으로 추가 (로그 출력 활성화)
+RUN set -x && \
+    go get -v \
+    github.com/mattn/go-sqlite3 \
+    github.com/goccy/go-zetasqlite \
+    github.com/stretchr/testify/assert \
+    go.mongodb.org/mongo-driver/bson \
+    go.mongodb.org/mongo-driver/mongo/integration/mtest \
+    cel.dev/expr \
+    github.com/felixge/httpsnoop
 
-# ✅ 7. `go install` 실행 (캐싱하여 빌드 속도 개선)
-RUN go install ./...
+# ✅ 특정 무거운 라이브러리 미리 빌드하여 캐싱 최적화 (빌드 과정 출력 포함)
+RUN set -x && \
+    go build -v -x -o /dev/null \
+    github.com/mattn/go-sqlite3 \
+    github.com/goccy/go-zetasqlite \
+    github.com/stretchr/testify/assert \
+    go.mongodb.org/mongo-driver/bson \
+    go.mongodb.org/mongo-driver/mongo/integration/mtest \
+    cel.dev/expr \
+    github.com/felixge/httpsnoop
 
-# ✅ 8. 실행 시 `.env.local`이 있을 경우 환경 변수 로드 후 테스트 실행
-CMD ["go", "test", "./...", "-coverprofile=coverage.out", "-v"]
+
+# ✅ 2. 의존성 캐싱 스테이지
+FROM golang:1.23.7 AS deps
+
+RUN apt update && apt install -y \
+    g++-12 gcc-12 clang make zsh curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+ENV GOPATH=/root/go \
+    GOROOT=/usr/local/go \
+    GOBIN=/root/go/bin \
+    PATH="/root/go/bin:/usr/local/go/bin:$PATH" \
+    CGO_ENABLED=1 \
+    CC=gcc \
+    CXX=clang++ \
+    CXXFLAGS="-Wno-macro-redefined -Wno-unknown-warning-option" \
+    CGO_LDFLAGS="-Wl,--allow-multiple-definition" \
+    GOMODCACHE=/root/go/pkg/mod \
+    GOCACHE=/root/.cache/go-build
+
+# ✅ 사전 컴파일된 의존성 캐싱된 빌드 재사용
+COPY --from=deps-prebuild /root/go/pkg/mod /root/go/pkg/mod
+COPY --from=deps-prebuild /root/.cache/go-build /root/.cache/go-build
+COPY go.mod go.sum ./
+RUN go mod verify
+
+# ✅ 3. 테스트 실행 스테이지
+FROM deps AS test
+COPY . ./
+
+# ✅ 모든 테스트 수행 (병렬 실행 제거)
+CMD ["go", "test", "./...", "-v", "-coverprofile=coverage.out"]

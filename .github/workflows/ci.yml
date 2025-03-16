@@ -1,4 +1,4 @@
-name: Go CI (Whale Tracker)
+name: Go Automatic Test CI (Whale Tracker)
 
 on:
   push:
