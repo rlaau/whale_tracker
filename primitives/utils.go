@@ -19,7 +19,7 @@ func GetProjectRoot() string {
 	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
 	output, err := cmd.Output()
 	if err != nil {
-		log.Fatal("❌ Git 루트 디렉토리를 찾을 수 없습니다. 프로젝트 루트 경로를 수동으로 설정하세요.")
+		log.Fatal("Git 루트 디렉토리를 찾을 수 없습니다. 프로젝트 루트 경로를 수동으로 설정하세요.")
 	}
 	return string(output[:len(output)-1]) // 개행 문자 제거
 }
@@ -32,13 +32,13 @@ func LoadEnv() {
 	if _, err := os.Stat(envLocalPath); err == nil {
 		err = godotenv.Load(envLocalPath)
 		if err != nil {
-			log.Fatalf("❌ Error loading .env.local file: %v", err)
+			log.Fatalf(" Error loading .env.local file: %v", err)
 		}
 		log.Println("✅ Loaded .env.local")
 	} else {
 		err = godotenv.Load(envExamplePath)
 		if err != nil {
-			log.Fatalf("❌ Error loading .env.example file: %v", err)
+			log.Fatalf("Error loading .env.example file: %v", err)
 		}
 		log.Println("⚠️ .env.local not found, loaded .env.example instead")
 	}

@@ -9,7 +9,7 @@ type TimeFrame struct {
 	endTxId        TxId
 	endBlockNumber uint64
 
-	//그 외의 여러 경제지표도 재미삼아? 넣어보기
+	//*그 외의 여러 경제지표도 재미삼아? 넣어보기
 }
 
 const EntityClusterPeriodPerDay = 123                               //4개월
