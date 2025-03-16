@@ -20,12 +20,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
-      # ✅ 캐시를 활용한 Docker 빌드 속도 개선
-      - name: Build Docker Test Image
+      # ✅ Docker Buildx 캐시 활용 최적화 (빌드 시간 단축)
+      - name: Build Docker Test Image (with Cache)
         run: |
           docker buildx build \
-            --cache-from=type=gha \
-            --cache-to=type=gha,mode=max \
+            --cache-from=type=local,src=/tmp/.buildx-cache \
+            --cache-to=type=local,dest=/tmp/.buildx-cache \
             -t whale_tracker-test \
             -f docker/Dockerfile.test \
             --load .
@@ -39,7 +39,8 @@ jobs:
       # ✅ 테스트 커버리지 결과 출력
       - name: Show Coverage Results
         run: go tool cover -func=coverage.out || echo "No coverage report found"
-      # ✅ 테스트 커버리지 아티팩트 저장 (v3 -> v4 업데이트)
+
+      # ✅ 테스트 커버리지 아티팩트 저장 (v4)
       - name: Upload Coverage Report
         uses: actions/upload-artifact@v4
         with:
