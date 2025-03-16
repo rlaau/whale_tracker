@@ -1,5 +1,5 @@
 package main
 
 func main() {
-	println("sss")
+	println("변경")
 }
