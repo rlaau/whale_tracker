@@ -6,6 +6,7 @@ toolchain go1.23.7
 
 require (
 	cloud.google.com/go/bigquery v1.66.2
+	github.com/edsrzf/mmap-go v1.2.0
 	github.com/goccy/bigquery-emulator v0.6.6
 	github.com/joho/godotenv v1.5.1
 	github.com/stretchr/testify v1.10.0

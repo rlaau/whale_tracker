@@ -23,6 +23,7 @@ type PredefinedAddress interface {
 		ERC20TokenAddress |
 		LendingPoolAddress | LendingStakingTokenAddress |
 		SwapLiquidityPoolAddress | LiquidityPoolStakingTokenAddress |
+		RouterAddress |
 		BeaconDepositAddress |
 		NFTContractAddress |
 		BridgeAddress
@@ -51,6 +52,7 @@ type LendingStakingTokenAddress Address // Lending 예치 후 지급되는 이�
 type SwapLiquidityPoolAddress Address         // Uniswap, SushiSwap 등 AMM 컨트랙트 주소
 type LiquidityPoolStakingTokenAddress Address // LP토큰 컨트랙트 주소 (Uniswap LP토큰 등)
 
+type RouterAddress Address // Uniswap, SushiSwap 등 라우터 컨트랙트 주소
 // ETH 2.0 (Beacon Chain)
 type BeaconDepositAddress Address // ETH2.0 스테이킹 주소
 
