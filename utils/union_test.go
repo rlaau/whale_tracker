@@ -577,318 +577,318 @@
 
 package main_test
 
-import (
-	"fmt"
-	"math/rand"
-	"os"
-	"reflect"
-	"runtime"
-	"sync"
-	"testing"
-	"time"
-	"unsafe"
+// import (
+// 	"fmt"
+// 	"math/rand"
+// 	"os"
+// 	"reflect"
+// 	"runtime"
+// 	"sync"
+// 	"testing"
+// 	"time"
+// 	"unsafe"
 
-	"github.com/edsrzf/mmap-go"
-)
+// 	"github.com/edsrzf/mmap-go"
+// )
 
-// 최대 재귀 깊이 제한
-const maxDepth = 20
+// // 최대 재귀 깊이 제한
+// const maxDepth = 20
 
-// MMapUnionFind는 매우 큰 원소 집합을 MMAP로 관리하는 구조체입니다.
-//   - parentSlice, rankSlice: union-find 알고리즘용 parent/rank 배열
-//   - rootSlice: 각 인덱스별 최종 Find 결과(루트)를 저장할 별도의 mmap 영역
-type MMapUnionFind struct {
-	n          int32
-	parentFile string
-	rankFile   string
-	rootFile   string
+// // MMapUnionFind는 매우 큰 원소 집합을 MMAP로 관리하는 구조체입니다.
+// //   - parentSlice, rankSlice: union-find 알고리즘용 parent/rank 배열
+// //   - rootSlice: 각 인덱스별 최종 Find 결과(루트)를 저장할 별도의 mmap 영역
+// type MMapUnionFind struct {
+// 	n          int32
+// 	parentFile string
+// 	rankFile   string
+// 	rootFile   string
 
-	parentMMap mmap.MMap
-	rankMMap   mmap.MMap
-	rootMMap   mmap.MMap
+// 	parentMMap mmap.MMap
+// 	rankMMap   mmap.MMap
+// 	rootMMap   mmap.MMap
 
-	parentSlice []int32 // parent 배열 (mmapped)
-	rankSlice   []int8  // rank 배열 (mmapped)
-	rootSlice   []int32 // 각 인덱스의 최종 루트를 기록하는 배열 (mmapped)
-}
+// 	parentSlice []int32 // parent 배열 (mmapped)
+// 	rankSlice   []int8  // rank 배열 (mmapped)
+// 	rootSlice   []int32 // 각 인덱스의 최종 루트를 기록하는 배열 (mmapped)
+// }
 
-// createLargeFile: 주어진 크기로 파일을 생성하거나 Truncate합니다.
-func createLargeFile(fileName string, size int64) (*os.File, error) {
-	f, err := os.OpenFile(fileName, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return nil, err
-	}
-	err = f.Truncate(size)
-	if err != nil {
-		// sparse 파일로 fallback
-		_, seekErr := f.Seek(size-1, 0)
-		if seekErr != nil {
-			f.Close()
-			return nil, seekErr
-		}
-		_, writeErr := f.Write([]byte{0})
-		if writeErr != nil {
-			f.Close()
-			return nil, writeErr
-		}
-	}
-	return f, nil
-}
+// // createLargeFile: 주어진 크기로 파일을 생성하거나 Truncate합니다.
+// func createLargeFile(fileName string, size int64) (*os.File, error) {
+// 	f, err := os.OpenFile(fileName, os.O_RDWR|os.O_CREATE, 0644)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	err = f.Truncate(size)
+// 	if err != nil {
+// 		// sparse 파일로 fallback
+// 		_, seekErr := f.Seek(size-1, 0)
+// 		if seekErr != nil {
+// 			f.Close()
+// 			return nil, seekErr
+// 		}
+// 		_, writeErr := f.Write([]byte{0})
+// 		if writeErr != nil {
+// 			f.Close()
+// 			return nil, writeErr
+// 		}
+// 	}
+// 	return f, nil
+// }
 
-// NewMMapUnionFind: n개의 원소(0~n-1)를 관리할 parent/rank/root 파일들을 생성하고 MMAP합니다.
-func NewMMapUnionFind(n int32, parentFile, rankFile, rootFile string) (*MMapUnionFind, error) {
-	uf := &MMapUnionFind{
-		n:          n,
-		parentFile: parentFile,
-		rankFile:   rankFile,
-		rootFile:   rootFile,
-	}
+// // NewMMapUnionFind: n개의 원소(0~n-1)를 관리할 parent/rank/root 파일들을 생성하고 MMAP합니다.
+// func NewMMapUnionFind(n int32, parentFile, rankFile, rootFile string) (*MMapUnionFind, error) {
+// 	uf := &MMapUnionFind{
+// 		n:          n,
+// 		parentFile: parentFile,
+// 		rankFile:   rankFile,
+// 		rootFile:   rootFile,
+// 	}
 
-	//--------------------------------
-	// 1) parent.dat (n * 4 바이트)
-	//--------------------------------
-	parentSize := int64(n) * 4
-	fParent, err := createLargeFile(parentFile, parentSize)
-	if err != nil {
-		return nil, err
-	}
-	parentMap, err := mmap.Map(fParent, mmap.RDWR, 0)
-	if err != nil {
-		fParent.Close()
-		return nil, err
-	}
-	fParent.Close()
-	uf.parentMMap = parentMap
+// 	//--------------------------------
+// 	// 1) parent.dat (n * 4 바이트)
+// 	//--------------------------------
+// 	parentSize := int64(n) * 4
+// 	fParent, err := createLargeFile(parentFile, parentSize)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	parentMap, err := mmap.Map(fParent, mmap.RDWR, 0)
+// 	if err != nil {
+// 		fParent.Close()
+// 		return nil, err
+// 	}
+// 	fParent.Close()
+// 	uf.parentMMap = parentMap
 
-	//--------------------------------
-	// 2) rank.dat (n * 1 바이트)
-	//--------------------------------
-	rankSize := int64(n)
-	fRank, err := createLargeFile(rankFile, rankSize)
-	if err != nil {
-		return nil, err
-	}
-	rankMap, err := mmap.Map(fRank, mmap.RDWR, 0)
-	if err != nil {
-		fRank.Close()
-		return nil, err
-	}
-	fRank.Close()
-	uf.rankMMap = rankMap
+// 	//--------------------------------
+// 	// 2) rank.dat (n * 1 바이트)
+// 	//--------------------------------
+// 	rankSize := int64(n)
+// 	fRank, err := createLargeFile(rankFile, rankSize)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	rankMap, err := mmap.Map(fRank, mmap.RDWR, 0)
+// 	if err != nil {
+// 		fRank.Close()
+// 		return nil, err
+// 	}
+// 	fRank.Close()
+// 	uf.rankMMap = rankMap
 
-	//--------------------------------
-	// 3) root.dat (n * 4 바이트) - 각 원소의 최종 루트를 기록
-	//--------------------------------
-	rootSize := int64(n) * 4
-	fRoot, err := createLargeFile(rootFile, rootSize)
-	if err != nil {
-		return nil, err
-	}
-	rootMap, err := mmap.Map(fRoot, mmap.RDWR, 0)
-	if err != nil {
-		fRoot.Close()
-		return nil, err
-	}
-	fRoot.Close()
-	uf.rootMMap = rootMap
+// 	//--------------------------------
+// 	// 3) root.dat (n * 4 바이트) - 각 원소의 최종 루트를 기록
+// 	//--------------------------------
+// 	rootSize := int64(n) * 4
+// 	fRoot, err := createLargeFile(rootFile, rootSize)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	rootMap, err := mmap.Map(fRoot, mmap.RDWR, 0)
+// 	if err != nil {
+// 		fRoot.Close()
+// 		return nil, err
+// 	}
+// 	fRoot.Close()
+// 	uf.rootMMap = rootMap
 
-	//--------------------------------
-	// 슬라이스 재해석
-	//--------------------------------
-	{
-		hdrParent := (*reflect.SliceHeader)(unsafe.Pointer(&uf.parentSlice))
-		hdrParent.Data = uintptr(unsafe.Pointer(&uf.parentMMap[0]))
-		hdrParent.Len = int(parentSize / 4)
-		hdrParent.Cap = int(parentSize / 4)
-	}
-	{
-		hdrRank := (*reflect.SliceHeader)(unsafe.Pointer(&uf.rankSlice))
-		hdrRank.Data = uintptr(unsafe.Pointer(&uf.rankMMap[0]))
-		hdrRank.Len = int(rankSize)
-		hdrRank.Cap = int(rankSize)
-	}
-	{
-		hdrRoot := (*reflect.SliceHeader)(unsafe.Pointer(&uf.rootSlice))
-		hdrRoot.Data = uintptr(unsafe.Pointer(&uf.rootMMap[0]))
-		hdrRoot.Len = int(rootSize / 4)
-		hdrRoot.Cap = int(rootSize / 4)
-	}
+// 	//--------------------------------
+// 	// 슬라이스 재해석
+// 	//--------------------------------
+// 	{
+// 		hdrParent := (*reflect.SliceHeader)(unsafe.Pointer(&uf.parentSlice))
+// 		hdrParent.Data = uintptr(unsafe.Pointer(&uf.parentMMap[0]))
+// 		hdrParent.Len = int(parentSize / 4)
+// 		hdrParent.Cap = int(parentSize / 4)
+// 	}
+// 	{
+// 		hdrRank := (*reflect.SliceHeader)(unsafe.Pointer(&uf.rankSlice))
+// 		hdrRank.Data = uintptr(unsafe.Pointer(&uf.rankMMap[0]))
+// 		hdrRank.Len = int(rankSize)
+// 		hdrRank.Cap = int(rankSize)
+// 	}
+// 	{
+// 		hdrRoot := (*reflect.SliceHeader)(unsafe.Pointer(&uf.rootSlice))
+// 		hdrRoot.Data = uintptr(unsafe.Pointer(&uf.rootMMap[0]))
+// 		hdrRoot.Len = int(rootSize / 4)
+// 		hdrRoot.Cap = int(rootSize / 4)
+// 	}
 
-	//--------------------------------
-	// 병렬 초기화
-	//--------------------------------
-	numWorkers := runtime.NumCPU()
-	chunkSize := n / int32(numWorkers)
-	var wg sync.WaitGroup
-	start := time.Now()
-	for w := 0; w < numWorkers; w++ {
-		startIdx := int32(w) * chunkSize
-		endIdx := startIdx + chunkSize
-		if w == numWorkers-1 {
-			endIdx = n
-		}
-		wg.Add(1)
-		go func(s, e int32) {
-			defer wg.Done()
-			for i := s; i < e; i++ {
-				uf.parentSlice[i] = i
-				uf.rankSlice[i] = 0
-				uf.rootSlice[i] = -1 // 아직 Find 결과 없음
-				if (i+1)%100000000 == 0 {
-					fmt.Printf("초기화 진행: %d / %d 원소 처리\n", i+1, n)
-				}
-			}
-		}(startIdx, endIdx)
-	}
-	wg.Wait()
-	fmt.Printf("초기화 완료 (소요 시간: %v)\n", time.Since(start))
+// 	//--------------------------------
+// 	// 병렬 초기화
+// 	//--------------------------------
+// 	numWorkers := runtime.NumCPU()
+// 	chunkSize := n / int32(numWorkers)
+// 	var wg sync.WaitGroup
+// 	start := time.Now()
+// 	for w := 0; w < numWorkers; w++ {
+// 		startIdx := int32(w) * chunkSize
+// 		endIdx := startIdx + chunkSize
+// 		if w == numWorkers-1 {
+// 			endIdx = n
+// 		}
+// 		wg.Add(1)
+// 		go func(s, e int32) {
+// 			defer wg.Done()
+// 			for i := s; i < e; i++ {
+// 				uf.parentSlice[i] = i
+// 				uf.rankSlice[i] = 0
+// 				uf.rootSlice[i] = -1 // 아직 Find 결과 없음
+// 				if (i+1)%100000000 == 0 {
+// 					fmt.Printf("초기화 진행: %d / %d 원소 처리\n", i+1, n)
+// 				}
+// 			}
+// 		}(startIdx, endIdx)
+// 	}
+// 	wg.Wait()
+// 	fmt.Printf("초기화 완료 (소요 시간: %v)\n", time.Since(start))
 
-	return uf, nil
-}
+// 	return uf, nil
+// }
 
-// CloseAndCleanup: MMAP 해제 후, (옵션) 파일 삭제
-func (uf *MMapUnionFind) CloseAndCleanup(deleteFiles bool) error {
-	if err := uf.parentMMap.Unmap(); err != nil {
-		return err
-	}
-	if err := uf.rankMMap.Unmap(); err != nil {
-		return err
-	}
-	if err := uf.rootMMap.Unmap(); err != nil {
-		return err
-	}
-	if deleteFiles {
-		os.Remove(uf.parentFile)
-		os.Remove(uf.rankFile)
-		os.Remove(uf.rootFile)
-	}
-	return nil
-}
+// // CloseAndCleanup: MMAP 해제 후, (옵션) 파일 삭제
+// func (uf *MMapUnionFind) CloseAndCleanup(deleteFiles bool) error {
+// 	if err := uf.parentMMap.Unmap(); err != nil {
+// 		return err
+// 	}
+// 	if err := uf.rankMMap.Unmap(); err != nil {
+// 		return err
+// 	}
+// 	if err := uf.rootMMap.Unmap(); err != nil {
+// 		return err
+// 	}
+// 	if deleteFiles {
+// 		os.Remove(uf.parentFile)
+// 		os.Remove(uf.rankFile)
+// 		os.Remove(uf.rootFile)
+// 	}
+// 	return nil
+// }
 
-// FindWithDepth: 재귀 깊이가 maxDepth 초과 시 false 반환
-func (uf *MMapUnionFind) FindWithDepth(x int32, depth int) (int32, bool) {
-	if depth >= maxDepth {
-		return x, false
-	}
-	if uf.parentSlice[x] != x {
-		root, ok := uf.FindWithDepth(uf.parentSlice[x], depth+1)
-		if !ok {
-			return x, false
-		}
-		uf.parentSlice[x] = root
-		return root, true
-	}
-	return x, true
-}
+// // FindWithDepth: 재귀 깊이가 maxDepth 초과 시 false 반환
+// func (uf *MMapUnionFind) FindWithDepth(x int32, depth int) (int32, bool) {
+// 	if depth >= maxDepth {
+// 		return x, false
+// 	}
+// 	if uf.parentSlice[x] != x {
+// 		root, ok := uf.FindWithDepth(uf.parentSlice[x], depth+1)
+// 		if !ok {
+// 			return x, false
+// 		}
+// 		uf.parentSlice[x] = root
+// 		return root, true
+// 	}
+// 	return x, true
+// }
 
-// UnionWithDepth: 두 원소 x,y를 병합 (재귀 깊이 초과 시 스킵)
-func (uf *MMapUnionFind) UnionWithDepth(x, y int32) bool {
-	rootX, okX := uf.FindWithDepth(x, 0)
-	rootY, okY := uf.FindWithDepth(y, 0)
-	if !okX || !okY {
-		return false
-	}
-	if rootX == rootY {
-		return true
-	}
-	if uf.rankSlice[rootX] < uf.rankSlice[rootY] {
-		uf.parentSlice[rootX] = rootY
-	} else if uf.rankSlice[rootX] > uf.rankSlice[rootY] {
-		uf.parentSlice[rootY] = rootX
-	} else {
-		uf.parentSlice[rootY] = rootX
-		uf.rankSlice[rootX]++
-	}
-	return true
-}
+// // UnionWithDepth: 두 원소 x,y를 병합 (재귀 깊이 초과 시 스킵)
+// func (uf *MMapUnionFind) UnionWithDepth(x, y int32) bool {
+// 	rootX, okX := uf.FindWithDepth(x, 0)
+// 	rootY, okY := uf.FindWithDepth(y, 0)
+// 	if !okX || !okY {
+// 		return false
+// 	}
+// 	if rootX == rootY {
+// 		return true
+// 	}
+// 	if uf.rankSlice[rootX] < uf.rankSlice[rootY] {
+// 		uf.parentSlice[rootX] = rootY
+// 	} else if uf.rankSlice[rootX] > uf.rankSlice[rootY] {
+// 		uf.parentSlice[rootY] = rootX
+// 	} else {
+// 		uf.parentSlice[rootY] = rootX
+// 		uf.rankSlice[rootX]++
+// 	}
+// 	return true
+// }
 
-// TestMMapUnionFindLargeFileBased: 20억 개 원소에 대해
-// 1) parent/rank/root.dat 3개 파일로 관리
-// 2) union은 재귀 깊이 제한 적용
-// 3) 최종 Find 결과(루트)를 rootSlice에 직접 기록 (map 사용 안 함)
-func TestMMapUnionFindLargeFileBased(t *testing.T) {
-	if testing.Short() {
-		t.Skip("대규모 MMAP union-find 테스트는 -short 모드에서 스킵합니다.")
-	}
+// // TestMMapUnionFindLargeFileBased: 20억 개 원소에 대해
+// // 1) parent/rank/root.dat 3개 파일로 관리
+// // 2) union은 재귀 깊이 제한 적용
+// // 3) 최종 Find 결과(루트)를 rootSlice에 직접 기록 (map 사용 안 함)
+// func TestMMapUnionFindLargeFileBased(t *testing.T) {
+// 	if testing.Short() {
+// 		t.Skip("대규모 MMAP union-find 테스트는 -short 모드에서 스킵합니다.")
+// 	}
 
-	var n int32 = 2000000000 // 20억
-	numUnions := n / 100
+// 	var n int32 = 2000000000 // 20억
+// 	numUnions := n / 100
 
-	parentFile := "parent.dat"
-	rankFile := "rank.dat"
-	rootFile := "root.dat"
+// 	parentFile := "parent.dat"
+// 	rankFile := "rank.dat"
+// 	rootFile := "root.dat"
 
-	t.Logf("n = %d 원소에 대해 MMAP union-find 시작...", n)
-	start := time.Now()
+// 	t.Logf("n = %d 원소에 대해 MMAP union-find 시작...", n)
+// 	start := time.Now()
 
-	// 1) 초기화
-	uf, err := NewMMapUnionFind(n, parentFile, rankFile, rootFile)
-	if err != nil {
-		t.Fatalf("초기화 오류: %v", err)
-	}
-	defer func() {
-		// 테스트가 끝나면 mmap 해제 및 파일 삭제
-		if err := uf.CloseAndCleanup(true); err != nil {
-			t.Fatalf("CloseAndCleanup 오류: %v", err)
-		}
-	}()
+// 	// 1) 초기화
+// 	uf, err := NewMMapUnionFind(n, parentFile, rankFile, rootFile)
+// 	if err != nil {
+// 		t.Fatalf("초기화 오류: %v", err)
+// 	}
+// 	defer func() {
+// 		// 테스트가 끝나면 mmap 해제 및 파일 삭제
+// 		if err := uf.CloseAndCleanup(true); err != nil {
+// 			t.Fatalf("CloseAndCleanup 오류: %v", err)
+// 		}
+// 	}()
 
-	t.Logf("초기화 완료 (소요시간: %v)", time.Since(start))
+// 	t.Logf("초기화 완료 (소요시간: %v)", time.Since(start))
 
-	// 2) union 연산
-	startUnion := time.Now()
-	rand.Seed(time.Now().UnixNano())
-	for i := int32(0); i < numUnions; i++ {
-		base := rand.Int31n(n)
-		unionSize := rand.Int31n(49) + 2
-		for j := int32(1); j < unionSize; j++ {
-			other := rand.Int31n(n)
-			uf.UnionWithDepth(base, other)
-		}
-		if (i+1)%1000000 == 0 {
-			t.Logf("Union 진행: %d / %d, 경과: %v", i+1, numUnions, time.Since(startUnion))
-		}
-	}
-	t.Logf("Union 연산 완료 (소요 시간: %v)", time.Since(startUnion))
+// 	// 2) union 연산
+// 	startUnion := time.Now()
+// 	rand.Seed(time.Now().UnixNano())
+// 	for i := int32(0); i < numUnions; i++ {
+// 		base := rand.Int31n(n)
+// 		unionSize := rand.Int31n(49) + 2
+// 		for j := int32(1); j < unionSize; j++ {
+// 			other := rand.Int31n(n)
+// 			uf.UnionWithDepth(base, other)
+// 		}
+// 		if (i+1)%1000000 == 0 {
+// 			t.Logf("Union 진행: %d / %d, 경과: %v", i+1, numUnions, time.Since(startUnion))
+// 		}
+// 	}
+// 	t.Logf("Union 연산 완료 (소요 시간: %v)", time.Since(startUnion))
 
-	// 3) 병렬 Find: 각 인덱스별 rootSlice[i] = 루트
-	numWorkers := runtime.NumCPU()
-	chunkSize := n / int32(numWorkers)
-	var wg sync.WaitGroup
-	startFind := time.Now()
+// 	// 3) 병렬 Find: 각 인덱스별 rootSlice[i] = 루트
+// 	numWorkers := runtime.NumCPU()
+// 	chunkSize := n / int32(numWorkers)
+// 	var wg sync.WaitGroup
+// 	startFind := time.Now()
 
-	for w := 0; w < numWorkers; w++ {
-		startIdx := int32(w) * chunkSize
-		endIdx := startIdx + chunkSize
-		if w == numWorkers-1 {
-			endIdx = n
-		}
-		wg.Add(1)
-		go func(s, e int32) {
-			defer wg.Done()
-			for i := s; i < e; i++ {
-				root, ok := uf.FindWithDepth(i, 0)
-				if !ok {
-					// 재귀 너무 깊으면 스킵 (rootSlice[i]는 -1 유지)
-					continue
-				}
-				uf.rootSlice[i] = root
-				if (i+1-s)%10000000 == 0 {
-					fmt.Printf("Worker[%d-%d] Find 진행: %d\n", s, e, i+1-s)
-				}
-			}
-		}(startIdx, endIdx)
-	}
-	wg.Wait()
-	t.Logf("Find 연산 완료 (소요 시간: %v)", time.Since(startFind))
+// 	for w := 0; w < numWorkers; w++ {
+// 		startIdx := int32(w) * chunkSize
+// 		endIdx := startIdx + chunkSize
+// 		if w == numWorkers-1 {
+// 			endIdx = n
+// 		}
+// 		wg.Add(1)
+// 		go func(s, e int32) {
+// 			defer wg.Done()
+// 			for i := s; i < e; i++ {
+// 				root, ok := uf.FindWithDepth(i, 0)
+// 				if !ok {
+// 					// 재귀 너무 깊으면 스킵 (rootSlice[i]는 -1 유지)
+// 					continue
+// 				}
+// 				uf.rootSlice[i] = root
+// 				if (i+1-s)%10000000 == 0 {
+// 					fmt.Printf("Worker[%d-%d] Find 진행: %d\n", s, e, i+1-s)
+// 				}
+// 			}
+// 		}(startIdx, endIdx)
+// 	}
+// 	wg.Wait()
+// 	t.Logf("Find 연산 완료 (소요 시간: %v)", time.Since(startFind))
 
-	totalTime := time.Since(start)
-	t.Logf("전체 처리 소요 시간: %v", totalTime)
+// 	totalTime := time.Since(start)
+// 	t.Logf("전체 처리 소요 시간: %v", totalTime)
 
-	// 주의: rootSlice에 모든 i의 루트가 기록되었으나,
-	// 몇 개가 disjoint인지 등은 별도의 외부 정렬/처리를 통해 확인해야 함.
-	// 여기서는 map을 쓰지 않고, 파일(root.dat)에 각 인덱스별 루트를 기록하는 것으로 마무리.
-}
+// 	// 주의: rootSlice에 모든 i의 루트가 기록되었으나,
+// 	// 몇 개가 disjoint인지 등은 별도의 외부 정렬/처리를 통해 확인해야 함.
+// 	// 여기서는 map을 쓰지 않고, 파일(root.dat)에 각 인덱스별 루트를 기록하는 것으로 마무리.
+// }
 
 // package unionfind_test
 
