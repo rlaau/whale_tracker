@@ -9,6 +9,9 @@ import (
 	"github.com/edsrzf/mmap-go"
 )
 
+const (
+	ChunkSize = 50_000_000 // 5000만개씩 처리
+)
 // 블룸 필터 구조체
 type BloomFilter struct {
 	// Bloom Filter 크기
@@ -79,12 +82,12 @@ func (i *IncrementalUnionFindProcessor) ProcessSingleSets(userSets []UserSet) (e
 	6. batchBuffer를 순회하며, 다음 과정을 거친다.
 	6-1 : i의 totalBloomfilter에서 batchBuffer값이 있는지 확인한다.
 	6-2: 토탈 블룸필터가 있다고 나오면 우선 그 값을 "needToCheck"에 추가하며, 없다고 나오면 "needToBatch"에 추가한다. 
-	6-3: "needToCheck"어레이에서, uint64값을 1억 단위 청크로 잘라서(0~99_999_999사이의 값을 한 청크로 하기), 1억 단위로 슬라이스해온 parentSlice값과 비교하여, 그 값이 이미 존재하는지 확인하다.
-	6-3: 이는, parentArchive를 다 로드할 수 없으므로, 1억개씩 슬라이스 청크를 가져와서 확인하기 위함이다.
+	6-3: "needToCheck"어레이에서, uint64값을 ChunkSize 단위 청크로 잘라서(0~49_999_999사이의 값을 한 청크로 하기), ChunkSize 단위로 슬라이스해온 parentSlice값과 비교하여, 그 값이 이미 존재하는지 확인하다.
+	6-3: 이는, parentArchive를 다 로드할 수 없으므로, ChunkSize 슬라이스 청크를 가져와서 확인하기 위함이다.
 	6-3: 만약 진짜로 있다고 판명된 경우 스킵하고,실제론 없다고 판명된 경우 이는 needToBatch에 추가한다. 
-	6-4: needToBatch어레이 역시, 그 값을 1억 단위 청크로 잘라서 순회한다. 각 요소는 1억짜리 parentSlice청크에 자기자신을 루트로 등록한다. 랭크 등도 같이 0으로 초기화한다다. 즉, 유니언파인드의 셋을 자기자신 셋으로 초기화하는 것이다.
-	6-4: 이러한 배칭(1억개의 청크 기반)연산은 BatchSingleSet을 통해 수행한다.
-	6-4: 이러한 배칭을 통해 페이지폴트를 1억번 마다 한번씩 일어나도록 줄일 수 있다.
+	6-4: needToBatch어레이 역시, 그 값을 ChunkSize 단위 청크로 잘라서 순회한다. 각 요소는 ChunkSize짜리 parentSlice청크에 자기자신을 루트로 등록한다. 랭크 등도 같이 0으로 초기화한다다. 즉, 유니언파인드의 셋을 자기자신 셋으로 초기화하는 것이다.
+	6-4: 이러한 배칭(ChunkSize개의 청크 기반)연산은 BatchSingleSet을 통해 수행한다.
+	6-4: 이러한 배칭을 통해 페이지폴트를 ChunkSize번 마다 한번씩 일어나도록 줄일 수 있다.
 	7. multeSets를 리턴한다. 
 	7. 즉, 해당 함수를 통해 "단일 크기 집합"에 대한 처리를 완료한 후, 복합 크기 집합을 리턴하는 것이다.
 
@@ -97,10 +100,10 @@ func (i *IncrementalUnionFindProcessor) BatchSingleSet(batchBuffer []uint64) err
 }
 
 func ParseByChunck (elements []uint64) map[int][]uint64 {
-	1. 해당 함수는, uint64배열을 받아서, 그 값을 1억을 기준으로 청킹한다.
+	1. 해당 함수는, uint64배열을 받아서, 그 값을 ChunkSize을 기준으로 청킹한다.
 	2. parsedByChunk맵을 초기화
 	3. elements를 순회한다.
-	4. 0~99_999_999사이의 값은 parsedByChunk[0]에 어펜드, 100_000_000~199_999_999 사이의 앖은 parsedByChunk[1]에 어펜드 하는으로 맵을 업데이트
+	4. 0~49_999_999사이의 값은 parsedByChunk[0]에 어펜드, 50_000_000~100_000_000 사이의 앖은 parsedByChunk[1]에 어펜드 하는으로 맵을 업데이트
 	5. parsedBychunk를 리턴한다. 
 }
 
@@ -109,9 +112,19 @@ func (i *IncrementalUnionFindProcessor) ProcessMultiSets(userSets []UserSet) (er
 
 
 
+	1. 우선 메모리 내에서, DisjointSet구조체를 이용해서 빠르게게 [userSet]들 간의 유니언 파인드를 처리한 후
+	1-1. disjointSets를 구해낸다. (정렬 등 아무 상관없고, 단지 disjoint한 리스트의 리스트만 만든다. 즉, disjointSet은 리스트이다.)
+	2. 이때, 임시로 type SetWithAnchor struct {root uint54, anchorAndRoot []uint64, set *disjointSet변수}를 만든다.
+	2-1. 여기서 anchor는 disjointSets의 원소들 중, "아카이브"에도 그 값이 있는 원소를 의미한다.const
+	2-1. disjointSet의 원소 "100"이 있고, 아카이브의 parnetSlice의 "100"이 0이 아니라면(즉, 존재한다면), 이를 anchor에 추가한다.
+	2-1. 또한, 
+	2-2. 이때도 페이지폴트 줄이기 위해, parentSlice에서 ChunkSize개씩 가져와서, 해당 SetWithAncor값을 업데이트 한다. 
 
-	1. 일단 지들끼리 유니언파인드시키기
-	2. 여기서 조금 특별한 구조 이용
+
+
+
+
+
 	3. 이후 루트 딱지 때고, 앵커 개수 기반 업뎃이냐 머지냐 구분해서 또 시도하기
 	4. 머지 시 히스토리 기록. (임시 버퍼)
 	5. 히스토리뿐 아니라, 이후 mongoDB변환시엔 rootSlice가 유용할지도...
@@ -147,7 +160,7 @@ func (i *IncrementalUnionFindProcessor) AddMultiSet(userSet UserSet) error {
     1. userSet.elements 중 첫 원소를 루트원소로 잡아서 유니언한다.
 	2. parentMap, rankMap을 만들어 element와 그 유니언, 랭크를 저장한다
 	2. parsedByChunk 딕셔너리를 만들어 ParseByChunck(userSet.elements)를 대입한다.
-	3. 해당 parseByChunk를 순회하며, parenMap,rankMap을 참고하여, 1억 단위로 받아온 슬라이스에 정보를 추가한다. 
+	3. 해당 parseByChunk를 순회하며, parenMap,rankMap을 참고하여, ChunkSize 단위로 받아온 슬라이스에 정보를 추가한다. 
 
 
 }
@@ -230,12 +243,6 @@ func (ds *DisjointSet) GetSets() map[uint64][]uint64 {
 		result[root] = append(result[root], element)
 	}
 
-	// 각 집합 내부를 정렬
-	for root := range result {
-		sort.Slice(result[root], func(i, j int) bool {
-			return result[root][i] < result[root][j]
-		})
-	}
 
 	return result
 }
@@ -252,10 +259,49 @@ func (ds *DisjointSet) PrintSets() {
 }
 
 
-// 테스트케이스 생성기
-// 분포에 따라 모든 집합 생성
+
+// 더 메모리 효율적인 GenerateSets 함수
+func GenerateSets(rangeValue uint64, setSize int, count int) []UserSet {
+	result := make([]UserSet, 0, count)
+
+	// 작은 청크로 나누어 진행
+
+	for len(result) < count {
+		// 지역 맵을 사용하여 청크마다 메모리 해제
+		usedElements := make(map[uint64]bool)
+		for i := 0; i < chunkSize && len(result) < count; i++ {
+			set := UserSet{Elements: make([]uint64, 0, setSize)}
+			// 중복되지 않는 원소를 setSize만큼 추가
+			for j := 0; j < setSize; j++ {
+				var element uint64
+				maxAttempts := 100 // 무한 루프 방지
+				attempts := 0
+
+				for attempts < maxAttempts {
+					element = uint64(rand.Int63n(int64(rangeValue))) + 1 // 1부터 시작
+					if !usedElements[element] {
+						break
+					}
+					attempts++
+				}
+
+				// maxAttempts에 도달하면 중복 허용
+				set.Elements = append(set.Elements, element)
+				usedElements[element] = true
+			}
+
+			result = append(result, set)
+		}
+	}
+	runtime.GC()
+
+	return result
+}
+
+// 대폭 개선된 GenerateAllSets 함수
 func GenerateAllSets(numSets uint64, rangeValue uint64) []UserSet {
-	// 분포에 따른 집합 수 계산
+
+	// 분포 계산은 동일하게 유지
 	singleCount := int(float64(numSets) * 0.90)   // 90%
 	twoCount := int(float64(numSets) * 0.07)      // 7%
 	threeCount := int(float64(numSets) * 0.01)    // 1%
@@ -277,29 +323,25 @@ func GenerateAllSets(numSets uint64, rangeValue uint64) []UserSet {
 
 	// 각 크기별 집합 생성
 	fmt.Println("1개 원소 집합 생성 중...")
-	allSets = append(allSets, GenerateSets(rangeValue, 1)[:singleCount]...)
-
+	allSets = append(allSets, GenerateSets(rangeValue, 1, singleCount)...)
 	fmt.Println("2개 원소 집합 생성 중...")
-	allSets = append(allSets, GenerateSets(rangeValue, 2)[:twoCount]...)
-
+	allSets = append(allSets, GenerateSets(rangeValue, 2, twoCount)...)
 	fmt.Println("3개 원소 집합 생성 중...")
-	allSets = append(allSets, GenerateSets(rangeValue, 3)[:threeCount]...)
-
+	allSets = append(allSets, GenerateSets(rangeValue, 3, threeCount)...)
 	fmt.Println("4-12개 원소 집합 생성 중...")
-	allSets = append(allSets, GenerateSets(rangeValue, 4)[:fourCount]...)
-	allSets = append(allSets, GenerateSets(rangeValue, 5)[:fiveCount]...)
-	allSets = append(allSets, GenerateSets(rangeValue, 6)[:sixCount]...)
-	allSets = append(allSets, GenerateSets(rangeValue, 7)[:sevenCount]...)
-	allSets = append(allSets, GenerateSets(rangeValue, 8)[:eightCount]...)
-	allSets = append(allSets, GenerateSets(rangeValue, 9)[:nineCount]...)
-	allSets = append(allSets, GenerateSets(rangeValue, 10)[:tenCount]...)
-	allSets = append(allSets, GenerateSets(rangeValue, 11)[:elevenCount]...)
-	allSets = append(allSets, GenerateSets(rangeValue, 12)[:twelveCount]...)
-
+	allSets = append(allSets, GenerateSets(rangeValue, 4, fourCount)...)
+	allSets = append(allSets, GenerateSets(rangeValue, 5, fiveCount)...)
+	allSets = append(allSets, GenerateSets(rangeValue, 6, sixCount)...)
+	allSets = append(allSets, GenerateSets(rangeValue, 7, sevenCount)...)
+	allSets = append(allSets, GenerateSets(rangeValue, 8, eightCount)...)
+	allSets = append(allSets, GenerateSets(rangeValue, 9, nineCount)...)
+	allSets = append(allSets, GenerateSets(rangeValue, 10, tenCount)...)
+	allSets = append(allSets, GenerateSets(rangeValue, 11, elevenCount)...)
+	allSets = append(allSets, GenerateSets(rangeValue, 12, twelveCount)...)
 	fmt.Println("다수 원소 집합 생성 중...")
-	allSets = append(allSets, GenerateSets(rangeValue, 20)[:twentyCount]...)
-	allSets = append(allSets, GenerateSets(rangeValue, 30)[:thirtyCount]...)
-	allSets = append(allSets, GenerateSets(rangeValue, 50)[:fiftyCount]...)
+	allSets = append(allSets, GenerateSets(rangeValue, 20, twentyCount)...)
+	allSets = append(allSets, GenerateSets(rangeValue, 30, thirtyCount)...)
+	allSets = append(allSets, GenerateSets(rangeValue, 50, fiftyCount)...)
 
 	// 랜덤하게 섞기
 	fmt.Println("집합 섞는 중...")
@@ -309,5 +351,50 @@ func GenerateAllSets(numSets uint64, rangeValue uint64) []UserSet {
 	})
 
 	fmt.Printf("총 %d개 집합 생성 완료\n", len(allSets))
+
 	return allSets
 }
+
+
+
+
+// 아래의 GenerateAndSaveSets 함수는 plnaB용 함수라, 지금은 사용 ㄴ
+//만약 한번에 2억개 집합 컨트롤 못할 경우 파일로 1억개씩 끊어서 two-phase로 처리하는 경우르 planB로 해둔 것
+// // 청크 단위로 집합을 생성하고 파일에 저장하는 함수
+// func GenerateAndSaveSets(numSets uint64, rangeValue uint64, phase int) (int, error) {
+// 	// 청크별로 파일 생성
+// 	totalChunks := (numSets + SetChunkSize - 1) / SetChunkSize // 올림 나눗셈
+// 	var totalSets int
+
+// 	for chunk := uint64(0); chunk < totalChunks; chunk++ {
+// 		// 현재 청크에서 생성할 집합 수 계산
+// 		chunkSetCount := SetChunkSize
+// 		if (chunk+1)*SetChunkSize > numSets {
+// 			chunkSetCount = int(numSets - chunk*SetChunkSize)
+// 		}
+
+// 		fmt.Printf("청크 %d/%d: %d개 집합 생성 중...\n", chunk+1, totalChunks, chunkSetCount)
+
+// 		// 결과 슬라이스
+// 		chunkSets := make([]UserSet, 0, chunkSetCount)
+
+// 		// 각 크기별 집합 생성
+// 		chunkSets = GenerateAllSets(uint64(chunkSetCount), rangeValue)
+
+// 		// 파일에 저장
+// 		fileName := fmt.Sprintf("%s_phase%d_chunk_%d.gob", SetFilePath, phase, chunk)
+// 		if err := SaveSetsToFile(chunkSets, fileName); err != nil {
+// 			return totalSets, err
+// 		}
+
+// 		totalSets += len(chunkSets)
+
+// 		// 메모리 정리
+// 		chunkSets = nil
+// 		runtime.GC()
+
+// 		fmt.Printf("  청크 %d 저장 완료 (%s)\n", chunk+1, fileName)
+// 	}
+
+// 	return totalSets, nil
+// }
