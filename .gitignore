@@ -21,5 +21,5 @@ dist/
 build/
 #데이터 및 특정 실행파일들
 *.bin
-*.dot
+*.dat
 utils/data
