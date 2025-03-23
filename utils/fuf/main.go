@@ -8,6 +8,8 @@ import (
 	"sort"
 	"sync"
 
+	"slices"
+
 	"golang.org/x/exp/mmap"
 )
 
@@ -17,7 +19,11 @@ const (
 	EntrySize      = 16                                  // 각 엔트리의 크기 (바이트): parent(8) + rank(4) + setSize(2) + padding(2)
 	PageSize       = 4096                                // 일반적인 시스템 페이지 크기
 	EntriesPerPage = (PageSize - HeaderSize) / EntrySize // 한 페이지당 엔트리 수
-	ChunkSize      = PageSize * 16                       // 한 번에 처리할 청크 크기 (16 페이지)
+	ChunkSize      = PageSize * 128                      // 한 번에 처리할 원소의 개수.
+	// 차지하는 메모리는 여기에 x16
+	// 차지하는 페이지는 상수값x16
+
+	HoldableChunks = 12
 
 	// 엔트리 내 필드 오프셋
 	ParentOffset  = 0  // 부모 포인터 오프셋 (8바이트)
@@ -25,7 +31,8 @@ const (
 	SetSizeOffset = 12 // 집합 크기 오프셋 (2바이트)
 
 	// 청크 관련 상수
-	MaxUpdatesBeforeFlush = 1000 // 이 개수만큼 업데이트가 쌓이면 자동으로 플러시
+	MaxUpdatesBeforeFlush = 100_000 // 이 개수만큼 업데이트가 쌓이면 자동으로 플러시
+	GapElementsForSync    = 100_000
 )
 
 // ElementData는 원소의 모든 데이터를 포함하는 구조체입니다.
@@ -41,10 +48,19 @@ type ChunkData struct {
 	Modified bool                   // 변경 여부 플래그
 }
 
+type UpdateType int
+
+const (
+	UpdateParent UpdateType = iota
+	UpdateRank
+	UpdateSize
+	UpdateAll
+)
+
 // UpdateOperation은 업데이트 종류와 관련 데이터를 포함하는 구조체입니다.
 type UpdateOperation struct {
 	ElementID uint64
-	Type      string // "parent", "rank", "setSize", "all"
+	Type      UpdateType // "parent", "rank", "setSize", "all"
 	Data      ElementData
 }
 
@@ -210,21 +226,76 @@ func (ds *MmapDisjointSet) flushChunk(chunkID uint64) error {
 		return nil // 청크가 없거나 변경되지 않은 경우 스킵
 	}
 
-	// 청크 내 모든 원소 디스크에 쓰기
-	for elementID, data := range chunk.Elements {
-		offset := ds.getElementOffset(elementID)
+	// 청크 내 원소 수에 따라 최적화 전략 결정
+	elementCount := len(chunk.Elements)
 
-		// ElementData를 바이트 데이터로 변환
+	// 페이지폴트 2번이면 되는경우
+	if elementCount <= 2 {
+		// 버퍼 재사용으로 메모리 할당 줄이기
 		entryData := make([]byte, EntrySize)
-		binary.LittleEndian.PutUint64(entryData[ParentOffset:ParentOffset+8], data.Parent)
-		binary.LittleEndian.PutUint32(entryData[RankOffset:RankOffset+4], uint32(data.Rank))
-		binary.LittleEndian.PutUint16(entryData[SetSizeOffset:SetSizeOffset+2], data.SetSize)
 
-		// 파일에 쓰기
-		_, err := ds.dataWriter.WriteAt(entryData, offset)
-		if err != nil {
-			return fmt.Errorf("청크 데이터 쓰기 실패: %v", err)
+		for elementID, data := range chunk.Elements {
+			offset := ds.getElementOffset(elementID)
+
+			binary.LittleEndian.PutUint64(entryData[ParentOffset:ParentOffset+8], data.Parent)
+			binary.LittleEndian.PutUint32(entryData[RankOffset:RankOffset+4], uint32(data.Rank))
+			binary.LittleEndian.PutUint16(entryData[SetSizeOffset:SetSizeOffset+2], data.SetSize)
+
+			if _, err := ds.dataWriter.WriteAt(entryData, offset); err != nil {
+				return fmt.Errorf("청크 데이터 쓰기 실패: %v", err)
+			}
 		}
+	} else {
+		println("청크 내 원소가 임계값 이상임. 배치 처리로 판단함.")
+		// 청크 내 원소가 많을 경우, 변경 사항을 메모리에 모아서 일괄 쓰기
+
+		// 1. pwrite를 위한 오프셋-데이터 쌍 수집
+		type writeOp struct {
+			offset int64
+			data   []byte
+		}
+
+		writeOps := make([]writeOp, 0, elementCount)
+		bufferPool := make([]byte, elementCount*EntrySize) // 전체 버퍼 미리 할당
+		bufferOffset := 0
+
+		for elementID, data := range chunk.Elements {
+			offset := ds.getElementOffset(elementID)
+
+			// 버퍼 풀에서 메모리 슬라이스 가져오기
+			entryData := bufferPool[bufferOffset : bufferOffset+EntrySize]
+			bufferOffset += EntrySize
+
+			binary.LittleEndian.PutUint64(entryData[ParentOffset:ParentOffset+8], data.Parent)
+			binary.LittleEndian.PutUint32(entryData[RankOffset:RankOffset+4], uint32(data.Rank))
+			binary.LittleEndian.PutUint16(entryData[SetSizeOffset:SetSizeOffset+2], data.SetSize)
+
+			writeOps = append(writeOps, writeOp{
+				offset: offset,
+				data:   entryData,
+			})
+		}
+
+		// 2. writev 시스템 콜과 유사하게 작동하는 함수 구현
+		// 실제 writev가 있다면 그것을 사용하는 것이 더 좋음
+		// 여기서는 여러 쓰기 작업을 하나의 함수 호출로 모음
+
+		// 오프셋 기준으로 정렬 (디스크 접근 패턴 최적화)
+		sort.Slice(writeOps, func(i, j int) bool {
+			return writeOps[i].offset < writeOps[j].offset
+		})
+
+		if len(writeOps) > 0 {
+
+			// 4. 병합된 작업 실행
+			for _, op := range writeOps {
+				if _, err := ds.dataWriter.WriteAt(op.data, op.offset); err != nil {
+					return fmt.Errorf("병합된 청크 데이터 쓰기 실패: %v", err)
+				}
+			}
+
+		}
+
 	}
 
 	// 청크 상태 업데이트
@@ -371,7 +442,7 @@ func (ds *MmapDisjointSet) processUpdateQueue() {
 		// 각 업데이트 적용
 		for _, op := range chunkOps {
 			element, exists := chunk.Elements[op.ElementID]
-			if !exists && op.Type != "all" {
+			if !exists && op.Type != UpdateAll {
 				// 원소가 없고 'all' 타입이 아니면 초기 데이터 생성
 				element = ElementData{
 					Parent:  op.ElementID, // 자기 자신이 부모
@@ -382,17 +453,17 @@ func (ds *MmapDisjointSet) processUpdateQueue() {
 
 			// 업데이트 타입에 따라 처리
 			switch op.Type {
-			case "parent":
+			case UpdateParent:
 				element.Parent = op.Data.Parent
-			case "rank":
+			case UpdateRank:
 				element.Rank = op.Data.Rank
-			case "setSize":
+			case UpdateSize:
 				element.SetSize = op.Data.SetSize
 				// 루트 노드인 경우 캐시 업데이트
 				if op.ElementID == element.Parent {
 					ds.cacheSizeForRoot(op.ElementID, op.Data.SetSize)
 				}
-			case "all":
+			case UpdateAll:
 				element = op.Data
 				// 루트 노드인 경우 캐시 업데이트
 				if op.Data.Parent == op.ElementID && op.Data.SetSize > 0 {
@@ -452,7 +523,7 @@ func (ds *MmapDisjointSet) updateElementData(x uint64, data ElementData) {
 		// 업데이트 큐에 추가
 		ds.queueUpdate(UpdateOperation{
 			ElementID: x,
-			Type:      "all",
+			Type:      UpdateAll,
 			Data:      data,
 		})
 	} else {
@@ -691,7 +762,7 @@ func (ds *MmapDisjointSet) BatchMakeSet(elements []uint64) {
 	}
 
 	// 일정 간격으로 파일 동기화
-	if ds.elementCount%1000 == 0 {
+	if ds.elementCount%GapElementsForSync == 0 {
 		runtime.GC() // 명시적 GC 유도
 		ds.Flush()   // 파일 동기화
 	}
@@ -722,7 +793,7 @@ func (ds *MmapDisjointSet) MakeSet(x uint64) {
 	ds.elementCount++
 
 	// 일정 간격으로 파일 동기화
-	if ds.elementCount%1000 == 0 {
+	if ds.elementCount%GapElementsForSync == 0 {
 		runtime.GC() // 명시적 GC 유도
 		ds.Flush()   // 파일 동기화
 	}
@@ -783,21 +854,37 @@ func (ds *MmapDisjointSet) calcSetSize(root uint64) uint16 {
 	if ds.inMemoryMode {
 		ds.processUpdateQueue()
 	}
-
+	// 총 청크 수 계산
+	totalChunks := (ds.maxElement / ChunkSize) + 1
+	// 이미 로드된 청크들을, 언로드하는 것을 방지하기 위한 맵
+	keepChunks := make(map[uint64]bool)
 	// 모든 청크 검색하여 해당 루트에 속한 원소 카운트
 	var count uint32 = 0
+	// 모든 가능한 청크를, 하나씩 로드하면서 확인
+	for chunkID := uint64(0); chunkID < totalChunks; chunkID++ {
+		// 청크 로드 (이미 메모리에 있으면 그대로 사용)
+		chunk, err := ds.loadChunk(chunkID)
+		if err != nil {
+			continue // 로드 실패하면 다음 청크로
+		}
 
-	ds.chunkMutex.RLock()
-	for _, chunk := range ds.chunks {
-		for elemID, _ := range chunk.Elements {
+		// 나중에 언로드되지 않도록 표시
+		keepChunks[chunkID] = true
+
+		// 청크 내 모든 원소 확인
+		for elemID := range chunk.Elements {
 			// 해당 원소의 루트가 찾으려는 루트와 같은지 확인
 			elemRoot := ds.Find(elemID)
 			if elemRoot == root {
 				count++
 			}
 		}
+
+		// 메모리 부담을 줄이기 위해 일정 개수의 청크마다 불필요한 청크 언로드
+		if chunkID%HoldableChunks == 0 {
+			ds.unloadUnusedChunks(keepChunks)
+		}
 	}
-	ds.chunkMutex.RUnlock()
 
 	// 크기 캐싱
 	var size uint16
@@ -877,6 +964,7 @@ func (ds *MmapDisjointSet) BatchUnion(pairs [][2]uint64) {
 		}
 
 		// 루트 매핑 업데이트 (트랜지티브 클로저 처리)
+		// 자체 경로압축 느낌.
 		finalTo := to
 		for {
 			if nextTo, exists := rootUnions[finalTo]; exists {
@@ -897,8 +985,13 @@ func (ds *MmapDisjointSet) BatchUnion(pairs [][2]uint64) {
 
 	// 실제 병합 단계
 	// 1. 먼저 모든 크기 정보 미리 캐싱
+	uniqueRoots := make(map[uint64]bool)
+	for _, rootID := range rootMap {
+		uniqueRoots[rootID] = true
+	}
+
 	rootSizes := make(map[uint64]uint16)
-	for root := range rootMap {
+	for root := range uniqueRoots {
 		if _, exists := rootUnions[root]; !exists {
 			// 다른 집합에 흡수되지 않는 루트만 계산
 			size := ds.readSetSize(root)
@@ -1038,6 +1131,8 @@ func (ds *MmapDisjointSet) GetSetSize(x uint64) uint16 {
 }
 
 // GetSetsChunked는 현재 분리된 모든 집합들을 청크 단위로 계산하여 반환합니다.
+// ! 모든 disjointSet반환이므로, 대규모 연산에선 파일을 리턴시키기.
+// 그냥 맵 리턴하면 램 초과남
 func (ds *MmapDisjointSet) GetSetsChunked() map[uint64][]uint64 {
 	// 지연된 업데이트 모두 처리
 	ds.processUpdateQueue()
@@ -1078,10 +1173,10 @@ func (ds *MmapDisjointSet) GetSetsChunked() map[uint64][]uint64 {
 		}
 
 		// 100개 청크마다 사용하지 않는 청크 언로드
-		if chunk%100 == 99 {
+		if chunk%HoldableChunks == HoldableChunks-1 {
 			ds.unloadUnusedChunks(activeChunks)
 			activeChunks = make(map[uint64]bool)
-			for i := chunk - 99; i <= chunk; i++ {
+			for i := chunk - (HoldableChunks - 1); i <= chunk; i++ {
 				activeChunks[i] = true
 			}
 		}
@@ -1089,9 +1184,7 @@ func (ds *MmapDisjointSet) GetSetsChunked() map[uint64][]uint64 {
 
 	// 각 집합 내부를 정렬 (선택적)
 	for root := range result {
-		sort.Slice(result[root], func(i, j int) bool {
-			return result[root][i] < result[root][j]
-		})
+		slices.Sort(result[root])
 	}
 
 	return result
@@ -1171,8 +1264,8 @@ func fileSize(filePath string) int64 {
 func main() {
 	// 파일 경로 및 최대 원소 수 설정
 	dataFile := "disjoint_set_data.bin"
-	maxElement := uint64(100000) // 최대 10만 개의 원소
-	inMemoryMode := true         // 메모리 우선 모드 활성화
+	maxElement := uint64(1_000_000_000) // 최대 10만 개의 원소
+	inMemoryMode := true                // 메모리 우선 모드 활성화
 
 	// MmapDisjointSet 인스턴스 생성
 	ds, err := NewMmapDisjointSet(dataFile, maxElement, inMemoryMode)
@@ -1268,6 +1361,283 @@ func main() {
 		fmt.Printf("%s: %v\n", k, v)
 	}
 }
+
+// // UserSet은 하나의 분리 집합을 나타내는 구조체입니다.
+// type UserSet struct {
+// 	Elements []uint64
+// }
+
+// // 테스트케이스 생성기
+// // 특정 크기의 집합을 랜덤하게 생성합니다.
+// func GenerateSets(rangeValue uint64, setSize int) []UserSet {
+// 	result := make([]UserSet, 0)
+// 	usedElements := make(map[uint64]bool)
+
+// 	// 충분한 수의 집합 생성 (요청된 것보다 더 많이 생성하고 필요한 만큼 잘라서 사용)
+// 	for i := 0; i < 1000000; i++ {
+// 		set := UserSet{Elements: make([]uint64, 0, setSize)}
+
+// 		// 중복되지 않는 원소를 setSize만큼 추가
+// 		for j := 0; j < setSize; j++ {
+// 			var element uint64
+// 			for {
+// 				element = uint64(rand.Int63n(int64(rangeValue)))
+// 				if !usedElements[element] && element > 0 {
+// 					break
+// 				}
+// 			}
+// 			set.Elements = append(set.Elements, element)
+// 			usedElements[element] = true
+// 		}
+
+// 		result = append(result, set)
+
+// 		// 충분한 수의 집합을 생성했으면 종료
+// 		if len(result) >= 1000000 {
+// 			break
+// 		}
+// 	}
+
+// 	return result
+// }
+
+// // 테스트케이스 생성기
+// // 분포에 따라 모든 집합 생성
+// func GenerateAllSets(numSets uint64, rangeValue uint64) []UserSet {
+// 	// 분포에 따른 집합 수 계산
+// 	singleCount := int(float64(numSets) * 0.90)   // 90%
+// 	twoCount := int(float64(numSets) * 0.07)      // 7%
+// 	threeCount := int(float64(numSets) * 0.01)    // 1%
+// 	fourCount := int(float64(numSets) * 0.005)    // 0.5%
+// 	fiveCount := int(float64(numSets) * 0.0025)   // 0.25%
+// 	sixCount := int(float64(numSets) * 0.0025)    // 0.25%
+// 	sevenCount := int(float64(numSets) * 0.0025)  // 0.25%
+// 	eightCount := int(float64(numSets) * 0.0025)  // 0.25%
+// 	nineCount := int(float64(numSets) * 0.001)    // 0.1%
+// 	tenCount := int(float64(numSets) * 0.001)     // 0.1%
+// 	elevenCount := int(float64(numSets) * 0.0005) // 0.05%
+// 	twelveCount := int(float64(numSets) * 0.0005) // 0.05%
+// 	twentyCount := int(float64(numSets) * 0.0003) // 0.03%
+// 	thirtyCount := int(float64(numSets) * 0.0001) // 0.01%
+// 	fiftyCount := int(float64(numSets) * 0.0001)  // 0.01%
+
+// 	// 결과 슬라이스
+// 	allSets := make([]UserSet, 0, numSets)
+
+// 	// 각 크기별 집합 생성
+// 	fmt.Println("1개 원소 집합 생성 중...")
+// 	allSets = append(allSets, GenerateSets(rangeValue, 1)[:singleCount]...)
+
+// 	fmt.Println("2개 원소 집합 생성 중...")
+// 	allSets = append(allSets, GenerateSets(rangeValue, 2)[:twoCount]...)
+
+// 	fmt.Println("3개 원소 집합 생성 중...")
+// 	allSets = append(allSets, GenerateSets(rangeValue, 3)[:threeCount]...)
+
+// 	fmt.Println("4-12개 원소 집합 생성 중...")
+// 	allSets = append(allSets, GenerateSets(rangeValue, 4)[:fourCount]...)
+// 	allSets = append(allSets, GenerateSets(rangeValue, 5)[:fiveCount]...)
+// 	allSets = append(allSets, GenerateSets(rangeValue, 6)[:sixCount]...)
+// 	allSets = append(allSets, GenerateSets(rangeValue, 7)[:sevenCount]...)
+// 	allSets = append(allSets, GenerateSets(rangeValue, 8)[:eightCount]...)
+// 	allSets = append(allSets, GenerateSets(rangeValue, 9)[:nineCount]...)
+// 	allSets = append(allSets, GenerateSets(rangeValue, 10)[:tenCount]...)
+// 	allSets = append(allSets, GenerateSets(rangeValue, 11)[:elevenCount]...)
+// 	allSets = append(allSets, GenerateSets(rangeValue, 12)[:twelveCount]...)
+
+// 	fmt.Println("다수 원소 집합 생성 중...")
+// 	allSets = append(allSets, GenerateSets(rangeValue, 20)[:twentyCount]...)
+// 	allSets = append(allSets, GenerateSets(rangeValue, 30)[:thirtyCount]...)
+// 	allSets = append(allSets, GenerateSets(rangeValue, 50)[:fiftyCount]...)
+
+// 	// 랜덤하게 섞기
+// 	fmt.Println("집합 섞는 중...")
+// 	rand.Seed(time.Now().UnixNano())
+// 	rand.Shuffle(len(allSets), func(i, j int) {
+// 		allSets[i], allSets[j] = allSets[j], allSets[i]
+// 	})
+
+// 	fmt.Printf("총 %d개 집합 생성 완료\n", len(allSets))
+// 	return allSets
+// }
+
+// // 메인 함수 - 대규모 Union-Find 테스트 수행
+// func main() {
+// 	startTime := time.Now()
+
+// 	// 파일 경로 및 최대 원소 수 설정
+// 	dataFile := "large_disjoint_set.bin"
+// 	maxElement := uint64(2_000_000_000) // 20억 개의 원소
+// 	inMemoryMode := true                // 메모리 우선 모드 활성화
+
+// 	// 파일이 이미 존재하면 삭제 (새로 시작)
+// 	if _, err := os.Stat(dataFile); err == nil {
+// 		fmt.Println("기존 파일을 삭제합니다...")
+// 		os.Remove(dataFile)
+// 	}
+
+// 	// MmapDisjointSet 인스턴스 생성
+// 	fmt.Println("Disjoint Set 초기화 중...")
+// 	ds, err := NewMmapDisjointSet(dataFile, maxElement, inMemoryMode)
+// 	if err != nil {
+// 		fmt.Printf("Error: %v\n", err)
+// 		return
+// 	}
+// 	defer ds.Close() // 리소스 정리
+
+// 	fmt.Println("초기화 완료:", time.Since(startTime))
+
+// 	// 첫 번째 단계: 2억 개 원소 처리
+// 	processPhase(ds, 1, 200_000_000)
+
+// 	// 두 번째 단계: 추가 2억 개 원소 처리
+// 	processPhase(ds, 2, 200_000_000)
+
+// 	// 최종 통계 정보 출력
+// 	fmt.Println("\n=== 최종 통계 정보 ===")
+// 	stats := ds.GetStats()
+// 	for k, v := range stats {
+// 		fmt.Printf("%s: %v\n", k, v)
+// 	}
+
+// 	fmt.Printf("\n총 실행 시간: %v\n", time.Since(startTime))
+// }
+
+// // 각 단계별 처리 함수
+// func processPhase(ds *MmapDisjointSet, phase int, numElements uint64) {
+// 	phaseStartTime := time.Now()
+// 	fmt.Printf("\n=== 단계 %d 시작: %d 개 원소 처리 ===\n", phase, numElements)
+
+// 	// 단계별 시작 범위 설정
+// 	startRange := uint64((phase - 1) * 200_000_000 + 1)
+// 	endRange := uint64(phase * 200_000_000)
+
+// 	// 1. 테스트 데이터 생성
+// 	fmt.Printf("테스트 데이터 생성 중 (범위: %d ~ %d)...\n", startRange, endRange)
+
+// 	// 집합 수 계산 (원소 수보다 적어야 함)
+// 	numSets := numElements / 5 // 약 4천만 개의 집합
+
+// 	// 집합 생성
+// 	setGenStart := time.Now()
+// 	userSets := GenerateAllSets(numSets, endRange)
+// 	fmt.Printf("데이터 생성 완료: %v\n", time.Since(setGenStart))
+
+// 	// 2. BatchMakeSet으로 모든 원소 추가
+// 	fmt.Println("모든 원소를 Disjoint Set에 추가하는 중...")
+// 	makeSetStart := time.Now()
+
+// 	// 모든 원소 수집
+// 	allElements := make([]uint64, 0)
+// 	for _, set := range userSets {
+// 		allElements = append(allElements, set.Elements...)
+// 	}
+
+// 	// 청크 단위로 처리하여 메모리 사용량 제한
+// 	const chunkSize = 1_000_000 // 한 번에 처리할 원소 수
+// 	for i := 0; i < len(allElements); i += chunkSize {
+// 		end := i + chunkSize
+// 		if end > len(allElements) {
+// 			end = len(allElements)
+// 		}
+
+// 		chunk := allElements[i:end]
+// 		ds.BatchMakeSet(chunk)
+
+// 		// 진행 상황 로깅 (10% 단위)
+// 		if (i/chunkSize)%10 == 0 {
+// 			fmt.Printf("  %d/%d 원소 추가 완료 (%.1f%%)\n", end, len(allElements), float64(end)*100/float64(len(allElements)))
+// 		}
+// 	}
+
+// 	fmt.Printf("원소 추가 완료: %v\n", time.Since(makeSetStart))
+
+// 	// 3. 각 집합 내의 원소들을 Union으로 연결
+// 	fmt.Println("집합 내 원소들을 Union으로 연결하는 중...")
+// 	unionStart := time.Now()
+
+// 	// 진행 상황 추적용 카운터
+// 	processedSets := 0
+// 	totalPairs := 0
+
+// 	// 모든 집합에 대해
+// 	for _, set := range userSets {
+// 		if len(set.Elements) <= 1 {
+// 			continue // 원소가 1개인 집합은 Union 필요 없음
+// 		}
+
+// 		// 집합 내 모든 원소를 첫 번째 원소와 Union
+// 		pairs := make([][2]uint64, 0, len(set.Elements)-1)
+// 		for i := 1; i < len(set.Elements); i++ {
+// 			pairs = append(pairs, [2]uint64{set.Elements[0], set.Elements[i]})
+// 		}
+
+// 		// BatchUnion 수행
+// 		ds.BatchUnion(pairs)
+
+// 		// 진행 상황 업데이트
+// 		processedSets++
+// 		totalPairs += len(pairs)
+
+// 		// 진행 상황 로깅 (5% 단위)
+// 		if processedSets%(len(userSets)/20) == 0 {
+// 			fmt.Printf("  %d/%d 집합 처리 완료 (%.1f%%)\n",
+// 				processedSets, len(userSets), float64(processedSets)*100/float64(len(userSets)))
+// 		}
+
+// 		// 메모리 관리: 주기적으로 GC 실행 및 디스크 플러시
+// 		if processedSets%10000 == 0 {
+// 			runtime.GC()
+// 			ds.Flush()
+// 		}
+// 	}
+
+// 	fmt.Printf("Union 연산 완료: %v (총 %d 페어 처리)\n", time.Since(unionStart), totalPairs)
+
+// 	// 4. 무작위로 Find 연산 수행하여 검증
+// 	fmt.Println("무작위 Find 연산으로 검증 중...")
+// 	findStart := time.Now()
+
+// 	// 무작위 원소 선택
+// 	sampleSize := 10000
+// 	if sampleSize > len(allElements) {
+// 		sampleSize = len(allElements)
+// 	}
+
+// 	// 샘플 원소들
+// 	sampleElements := make([]uint64, sampleSize)
+// 	for i := 0; i < sampleSize; i++ {
+// 		sampleElements[i] = allElements[rand.Intn(len(allElements))]
+// 	}
+
+// 	// BatchFind 수행
+// 	roots := ds.BatchFind(sampleElements)
+
+// 	// 결과 요약
+// 	uniqueRoots := make(map[uint64]int)
+// 	for _, root := range roots {
+// 		uniqueRoots[root]++
+// 	}
+
+// 	fmt.Printf("Find 연산 완료: %v\n", time.Since(findStart))
+// 	fmt.Printf("샘플 %d개 중 고유 루트 개수: %d\n", sampleSize, len(uniqueRoots))
+
+// 	// 5. 모든 변경사항 디스크에 반영
+// 	fmt.Println("모든 변경사항 디스크에 반영 중...")
+// 	flushStart := time.Now()
+// 	ds.Flush()
+// 	fmt.Printf("디스크 반영 완료: %v\n", time.Since(flushStart))
+
+// 	// 6. 통계 정보 출력
+// 	fmt.Printf("\n=== 단계 %d 완료 ===\n", phase)
+// 	fmt.Printf("단계별 처리 시간: %v\n", time.Since(phaseStartTime))
+
+// 	stats := ds.GetStats()
+// 	fmt.Println("현재 통계:")
+// 	fmt.Printf("총 원소 수: %d\n", stats["elementCount"])
+// 	fmt.Printf("메모리에 로드된 청크 수: %d\n", stats["loadedChunks"])
+// 	fmt.Printf("파일 크기: %.2f GB\n", float64(stats["fileSize"].(int64))/(1024*1024*1024))
+// }
 
 // package main
 
