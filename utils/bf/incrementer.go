@@ -1,35 +1,28 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"syscall"
+	"unsafe"
 
 	"github.com/edsrzf/mmap-go"
 )
 
-const (
-	ChunkSize = 50_000_000 // 5000만개씩 처리
-)
-
-// 블룸 필터 구조체
-type BloomFilter struct {
-	// Bloom Filter 크기
-	size uint64
-	// Bloom Filter 배열
-	bf []uint64
-	// 해시 함수 개수
-	hashFunctions uint64
-}
+// 약 1천만 개의 원소까지는 홀딩 전까지 clean up을 하지 않는다.
+// 근데 이게 운이 좋아야 1천만이지. 페이지 다양하게 뜨면 무리임.
+// 경우에 따라서 적절히 줄이기. 다만 너무 줄이면 madvise오버헤드 너무 커짐.
+const MaxLoadStack = 10_000_000
 
 // 사용자 집합 구조체
 type UserSet struct {
 	// 집합 크기
-	size uint16
+	Size uint16
 	// 집합 원소
-	elements []uint64
+	Elements []uint64
 }
 
 // 점진적 유니온 파인드 프로세서
@@ -49,9 +42,10 @@ type IncrementalUnionFindProcessor struct {
 	parentSlice []uint64
 	rankSlice   []uint8
 	sizeSlice   []uint16
-	// 윈도우 정보
-	windowStart uint64
-	windowEnd   uint64
+
+	//현재 얼마만큼 페이지와 데이터를 홀딩하고 있는지
+	currentHoldingElements uint64
+
 	// 블룸 필터
 	//오탐률 0.5%정도, 해시함수 8개.
 	totalBloomFilter *BloomFilter // 전체 원소
@@ -103,11 +97,11 @@ func (i *IncrementalUnionFindProcessor) ProcessSingleSets(userSets []UserSet) (e
 	// 2. userSets를 순회한다.
 	for _, userSet := range userSets {
 		// 3. 만약 userSets의 userSet의 size가 2 이상이면 이를 multiSets에 어펜드한다.
-		if userSet.size >= 2 {
+		if userSet.Size >= 2 {
 			multiSets = append(multiSets, userSet)
-		} else if userSet.size == 1 {
+		} else if userSet.Size == 1 {
 			// 4. 만약 UserSets의의 userSet의 size가 1이면 그 요소를 batchBuffer에 추가한다.
-			batchBuffer = append(batchBuffer, userSet.elements[0])
+			batchBuffer = append(batchBuffer, userSet.Elements[0])
 		}
 	}
 
@@ -135,26 +129,11 @@ func (i *IncrementalUnionFindProcessor) ProcessSingleSets(userSets []UserSet) (e
 			// 청크로 분리하여 처리
 			parsedByChunk := ParseByChunk(needToCheck)
 
-			for chunkIndex, elements := range parsedByChunk {
-				// 청크 경계 계산
-				start := uint64(chunkIndex) * ChunkSize
-				end := start + ChunkSize
-
-				// 청크 데이터 로드
-				if i.windowStart != start || i.windowEnd != end {
-					err := i.loadWindow(start, end)
-					if err != nil {
-						return err, nil
-					}
-				}
-
+			for _, elements := range parsedByChunk {
 				// 각 요소 확인
 				for _, element := range elements {
-					// 상대적 인덱스 계산
-					relativeIndex := element - start
-
 					// parentSlice에 값이 없으면(0이면) 실제로 없는 요소
-					if i.parentSlice[relativeIndex] == 0 {
+					if i.accessParent(element) == 0 {
 						needToBatch = append(needToBatch, element)
 					}
 				}
@@ -180,187 +159,20 @@ func (i *IncrementalUnionFindProcessor) BatchSingleSet(batchBuffer []uint64) err
 	// 1. batchBuffer를 순회하면서 각 값을 totalBloomFilter에 추가한다.
 	for _, element := range batchBuffer {
 		i.totalBloomFilter.Add(element)
+		i.totalElements++
 	}
 
 	// 2: parsedByChunk 딕셔너리를 생성 후 ParseByChunk(batchBuffer)를 대입한다.
 	parsedByChunk := ParseByChunk(batchBuffer)
 
 	// 3: 청크별로 처리
-	for chunkIndex, elements := range parsedByChunk {
-		// 청크 경계 계산
-		start := uint64(chunkIndex) * ChunkSize
-		end := start + ChunkSize
-
-		// 청크 데이터 로드
-		if i.windowStart != start || i.windowEnd != end {
-			err := i.loadWindow(start, end)
-			if err != nil {
-				return err
-			}
-		}
+	for _, elements := range parsedByChunk {
 
 		// 각 요소 초기화 (자기 자신이 루트)
 		for _, element := range elements {
-			// 상대적 인덱스 계산
-			relativeIndex := element - start
-
-			// 유니언 파인드 초기화: 부모는 자기 자신, 랭크 0, 크기 1
-			i.parentSlice[relativeIndex] = element
-			i.rankSlice[relativeIndex] = 0
-			i.sizeSlice[relativeIndex] = 1
-
-			// 총 요소 수 업데이트
-			if i.windowStart+relativeIndex >= i.totalElements {
-				i.totalElements = i.windowStart + relativeIndex + 1
-			}
+			i.setElement(element, element, 0, 1)
 		}
 
-		// 변경사항 저장
-		err := i.saveWindow()
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (i *IncrementalUnionFindProcessor) ProcessMultiSets(userSets []UserSet) error {
-	// 해당 함수는 크기가 2이상은 집합들을 IncrementalUnionFindProcessor의 아카이브에 반영한다.
-	if len(userSets) == 0 {
-		return nil
-	}
-
-	// 1. 우선 메모리 내에서, DisjointSet구조체를 이용해서 빠르게 유니언 파인드를 처리
-	ds := NewDisjointSet()
-
-	// 모든 요소를 DisjointSet에 추가하고 같은 셋끼리 유니언
-	for _, userSet := range userSets {
-		if len(userSet.elements) < 2 {
-			continue
-		}
-
-		root := userSet.elements[0]
-		ds.MakeSet(root)
-
-		for _, element := range userSet.elements[1:] {
-			ds.MakeSet(element)
-			ds.Union(root, element)
-		}
-	}
-
-	// 1-1. disjointSets 구하기
-	disjointSets := ds.GetSets()
-
-	// SetWithAnchor 구조체 정의
-	type SetWithAnchor struct {
-		anchorToRoot map[uint64]uint64
-		set          []uint64
-	}
-
-	// 각 분리 집합 처리
-	for _, elements := range disjointSets {
-		// 2-1. 앵커 후보 찾기 - multiBloomFilter에 있는 요소들
-		maybeAnchor := []uint64{}
-		for _, element := range elements {
-			if i.multiBloomFilter.MayContain(element) {
-				maybeAnchor = append(maybeAnchor, element)
-			}
-		}
-
-		// 2-1. 청크별로 분류
-		maybeAnchorByChunk := ParseByChunk(maybeAnchor)
-
-		// 3. 실제 앵커 확인 및 루트 찾기
-		anchorToRoot := make(map[uint64]uint64)
-
-		for chunkIndex, anchors := range maybeAnchorByChunk {
-			// 청크 경계 계산
-			start := uint64(chunkIndex) * ChunkSize
-			end := start + ChunkSize
-
-			// 청크 데이터 로드
-			if i.windowStart != start || i.windowEnd != end {
-				err := i.loadWindow(start, end)
-				if err != nil {
-					return err
-				}
-			}
-
-			// 각 앵커 확인
-			for _, anchor := range anchors {
-				// 상대적 인덱스 계산
-				relativeIndex := anchor - start
-
-				// 실제 존재하는 요소인지 확인
-				if i.parentSlice[relativeIndex] != 0 {
-					// 3-1. 루트 찾기
-					root := i.findRoot(anchor)
-					anchorToRoot[anchor] = root
-				}
-			}
-		}
-
-		// SetWithAnchor 생성
-		swa := SetWithAnchor{
-			anchorToRoot: anchorToRoot,
-			set:          elements,
-		}
-
-		// 4. 앵커 상황에 따른 처리
-		if len(swa.anchorToRoot) == 0 {
-			// 4-1. 앵커가 없는 경우: 새 집합 추가
-			newSet := UserSet{
-				size:     uint16(len(swa.set)),
-				elements: swa.set,
-			}
-
-			// 새로운 다중 집합 일괄 추가
-			err := i.BatchAddMultiSet([]UserSet{newSet})
-			if err != nil {
-				return err
-			}
-		} else if len(swa.anchorToRoot) == 1 {
-			// 4-2. 앵커가 하나인 경우: 기존 집합 확장
-
-			var root uint64
-
-			// 유일한 앵커와 루트 가져오기
-			for _, r := range swa.anchorToRoot {
-				root = r
-				break
-			}
-
-			// UserSet 생성
-			newSet := UserSet{
-				size:     uint16(len(swa.set)),
-				elements: swa.set,
-			}
-
-			// 집합 확장
-			err := i.GrowMultiSet(newSet, root)
-			if err != nil {
-				return err
-			}
-		} else {
-			// 4-3. 앵커가 여러 개인 경우: 집합 병합
-			newSet := UserSet{
-				size:     uint16(len(swa.set)),
-				elements: swa.set,
-			}
-
-			// 여러 집합 병합
-			err := i.MergeMultiSet(newSet, swa.anchorToRoot)
-			if err != nil {
-				return err
-			}
-		}
-
-		// 4-4. 블룸 필터 업데이트
-		for _, element := range elements {
-			i.totalBloomFilter.Add(element)
-			i.multiBloomFilter.Add(element)
-		}
 	}
 
 	return nil
@@ -374,14 +186,14 @@ func (i *IncrementalUnionFindProcessor) BatchAddMultiSet(userSets []UserSet) err
 
 	// 2. 모든 요소를 청크별로 분류하고 루트 정보 기록
 	for _, userSet := range userSets {
-		if len(userSet.elements) == 0 {
+		if len(userSet.Elements) == 0 {
 			continue
 		}
 
 		// 첫 번째 요소를 루트로 사용
-		root := userSet.elements[0]
+		root := userSet.Elements[0]
 
-		for _, element := range userSet.elements {
+		for _, element := range userSet.Elements {
 			chunkIndex := int(element / ChunkSize)
 
 			if _, exists := chunkData[chunkIndex]; !exists {
@@ -397,84 +209,41 @@ func (i *IncrementalUnionFindProcessor) BatchAddMultiSet(userSets []UserSet) err
 	}
 
 	// 3. 청크별로 처리
-	for chunkIndex, data := range chunkData {
+	for _, data := range chunkData {
 		elements := data[0]
 		roots := data[1]
 
-		// 청크 경계 계산
-		start := uint64(chunkIndex) * ChunkSize
-		end := start + ChunkSize
-
-		// 청크 데이터 로드
-		if i.windowStart != start || i.windowEnd != end {
-			err := i.loadWindow(start, end)
-			if err != nil {
-				return err
-			}
-		}
-
 		// 각 요소 업데이트
 		for idx, element := range elements {
-			// 상대적 인덱스 계산
-			relativeIndex := element - start
 
 			// 부모 설정
-			i.parentSlice[relativeIndex] = roots[idx]
+			i.parentSlice[element] = roots[idx]
 
 			// 루트 요소인 경우 (자기 자신이 부모)
 			if element == roots[idx] {
-				// 루트는 랭크 0, 크기는 나중에 업데이트
-				i.rankSlice[relativeIndex] = 0
+				i.rankSlice[element] = 0
 			} else {
 				// 루트가 아닌 요소는 랭크 0, 크기 0
-				i.rankSlice[relativeIndex] = 0
-				i.sizeSlice[relativeIndex] = 0
+				i.rankSlice[element] = 0
+				i.sizeSlice[element] = 0
 			}
 
-			// 총 요소 수 업데이트
-			if i.windowStart+relativeIndex >= i.totalElements {
-				i.totalElements = i.windowStart + relativeIndex + 1
-			}
 		}
 
-		// 변경사항 저장
-		err := i.saveWindow()
-		if err != nil {
-			return err
-		}
 	}
 
 	// 4. 루트 요소의 크기 업데이트
 	for _, userSet := range userSets {
-		if len(userSet.elements) == 0 {
+		if len(userSet.Elements) == 0 {
 			continue
 		}
 
 		// 첫 번째 요소를 루트로 사용
-		root := userSet.elements[0]
-		chunkIndex := int(root / ChunkSize)
-
-		// 청크 경계 계산
-		start := uint64(chunkIndex) * ChunkSize
-		end := start + ChunkSize
-
-		// 청크 데이터 로드
-		if i.windowStart != start || i.windowEnd != end {
-			err := i.loadWindow(start, end)
-			if err != nil {
-				return err
-			}
-		}
+		root := userSet.Elements[0]
 
 		// 루트 요소의 크기 업데이트
-		relativeIndex := root - start
-		i.sizeSlice[relativeIndex] = userSet.size
+		i.sizeSlice[root] = userSet.Size
 
-		// 변경사항 저장
-		err := i.saveWindow()
-		if err != nil {
-			return err
-		}
 	}
 
 	return nil
@@ -482,7 +251,7 @@ func (i *IncrementalUnionFindProcessor) BatchAddMultiSet(userSets []UserSet) err
 
 func (i *IncrementalUnionFindProcessor) GrowMultiSet(userSet UserSet, rootElement uint64) error {
 	// 해당 함수는 다른 집합과 머지할 필요 없는, 닫힌 집합을 IncrementalUnionFindProcessor의 아카이브에 반영한다.
-	if len(userSet.elements) == 0 {
+	if len(userSet.Elements) == 0 {
 		return nil
 	}
 
@@ -494,29 +263,16 @@ func (i *IncrementalUnionFindProcessor) GrowMultiSet(userSet UserSet, rootElemen
 	sizeMap := make(map[uint64]uint16)
 
 	// 모든 요소의 부모를 루트로 설정
-	for _, element := range userSet.elements {
+	for _, element := range userSet.Elements {
 		parentMap[element] = rootElement
 
 		// 루트 요소인 경우
 		if element == rootElement {
 			rankMap[element] = 0
 			// 기존 크기 가져오기
-			rootChunkIndex := int(rootElement / ChunkSize)
-			rootStart := uint64(rootChunkIndex) * ChunkSize
-
-			// 이미 현재 청크가 아니라면 로드
-			if i.windowStart != rootStart || i.windowEnd != rootStart+ChunkSize {
-				err := i.loadWindow(rootStart, rootStart+ChunkSize)
-				if err != nil {
-					return err
-				}
-			}
-
-			relativeIndex := rootElement - rootStart
-			existingSize := i.sizeSlice[relativeIndex]
-
+			existingSize := i.sizeSlice[element]
 			// 크기 업데이트 (기존 크기 + 새 요소 수)
-			sizeMap[element] = existingSize + uint16(len(userSet.elements)) - 1
+			sizeMap[element] = existingSize + uint16(len(userSet.Elements)) - 1
 		} else {
 			// 루트가 아닌 요소는 랭크 0, 크기 0
 			rankMap[element] = 0
@@ -525,47 +281,30 @@ func (i *IncrementalUnionFindProcessor) GrowMultiSet(userSet UserSet, rootElemen
 	}
 
 	// 3. 청크별로 요소 분류하여 처리
-	parsedByChunk := ParseByChunk(userSet.elements)
+	parsedByChunk := ParseByChunk(userSet.Elements)
 
-	for chunkIndex, elements := range parsedByChunk {
+	for _, elements := range parsedByChunk {
 		// 청크 경계 계산
-		start := uint64(chunkIndex) * ChunkSize
-		end := start + ChunkSize
-
-		// 청크 데이터 로드
-		if i.windowStart != start || i.windowEnd != end {
-			err := i.loadWindow(start, end)
-			if err != nil {
-				return err
-			}
-		}
 
 		// 각 요소 업데이트
 		for _, element := range elements {
 			// 상대적 인덱스 계산
-			relativeIndex := element - start
 
 			// 부모, 랭크, 크기 설정
-			i.parentSlice[relativeIndex] = parentMap[element]
-			i.rankSlice[relativeIndex] = rankMap[element]
-			i.sizeSlice[relativeIndex] = sizeMap[element]
+			i.parentSlice[element] = parentMap[element]
+			i.rankSlice[element] = rankMap[element]
+			i.sizeSlice[element] = sizeMap[element]
 
-			// 총 요소 수 업데이트
-			if i.windowStart+relativeIndex >= i.totalElements {
-				i.totalElements = i.windowStart + relativeIndex + 1
-			}
 		}
 
 		// 변경사항 저장
-		err := i.saveWindow()
-		if err != nil {
-			return err
-		}
+
 	}
 
 	// 블룸 필터 업데이트
-	for _, element := range userSet.elements {
+	for _, element := range userSet.Elements {
 		i.totalBloomFilter.Add(element)
+		i.totalElements++
 		i.multiBloomFilter.Add(element)
 	}
 
@@ -574,7 +313,7 @@ func (i *IncrementalUnionFindProcessor) GrowMultiSet(userSet UserSet, rootElemen
 
 func (i *IncrementalUnionFindProcessor) MergeMultiSet(userSet UserSet, anchorToRoot map[uint64]uint64) error {
 	// 여러 앵커가 존재하는 상황에서, 아카이브의 여러 트리를 병합하는 함수이다.
-	if len(userSet.elements) == 0 || len(anchorToRoot) == 0 {
+	if len(userSet.Elements) == 0 || len(anchorToRoot) == 0 {
 		return nil
 	}
 
@@ -591,25 +330,11 @@ func (i *IncrementalUnionFindProcessor) MergeMultiSet(userSet UserSet, anchorToR
 		if _, exists := rootRanks[root]; !exists {
 			allRoots = append(allRoots, root)
 
-			// 루트 정보 가져오기
-			rootChunkIndex := int(root / ChunkSize)
-			rootStart := uint64(rootChunkIndex) * ChunkSize
-			rootEnd := rootStart + ChunkSize
-
-			// 루트 청크 로드
-			if i.windowStart != rootStart || i.windowEnd != rootEnd {
-				err := i.loadWindow(rootStart, rootEnd)
-				if err != nil {
-					return err
-				}
-			}
-
-			// 상대적 인덱스 계산
-			relativeIndex := root - rootStart
+			// 루트 정보 가져오
 
 			// 랭크와 크기 저장
-			rootRanks[root] = i.rankSlice[relativeIndex]
-			rootSizes[root] = i.sizeSlice[relativeIndex]
+			rootRanks[root] = i.rankSlice[root]
+			rootSizes[root] = i.sizeSlice[root]
 		}
 	}
 
@@ -659,7 +384,7 @@ func (i *IncrementalUnionFindProcessor) MergeMultiSet(userSet UserSet, anchorToR
 		}
 
 		// 사용자 집합에서 기존 앵커에 없는 요소 수 계산
-		for _, element := range userSet.elements {
+		for _, element := range userSet.Elements {
 			if _, exists := anchorToRoot[element]; !exists {
 				newSize++
 			}
@@ -699,7 +424,7 @@ func (i *IncrementalUnionFindProcessor) MergeMultiSet(userSet UserSet, anchorToR
 		}
 
 		// userSet의 모든 요소 추가
-		for _, element := range userSet.elements {
+		for _, element := range userSet.Elements {
 			if _, exists := anchorToRoot[element]; !exists {
 				elementsToUpdate[element] = struct {
 					parent uint64
@@ -725,48 +450,26 @@ func (i *IncrementalUnionFindProcessor) MergeMultiSet(userSet UserSet, anchorToR
 		}
 
 		// 각 청크별로 처리
-		for chunkIndex, elements := range elementsByChunk {
-			// 청크 경계 계산
-			start := uint64(chunkIndex) * ChunkSize
-			end := start + ChunkSize
-
-			// 청크 데이터 로드
-			if i.windowStart != start || i.windowEnd != end {
-				err := i.loadWindow(start, end)
-				if err != nil {
-					return err
-				}
-			}
+		for _, elements := range elementsByChunk {
 
 			// 각 요소 업데이트
 			for _, element := range elements {
 				update := elementsToUpdate[element]
 
-				// 상대적 인덱스 계산
-				relativeIndex := element - start
-
 				// 부모, 랭크, 크기 업데이트
-				i.parentSlice[relativeIndex] = update.parent
-				i.rankSlice[relativeIndex] = update.rank
-				i.sizeSlice[relativeIndex] = update.size
+				i.parentSlice[element] = update.parent
+				i.rankSlice[element] = update.rank
+				i.sizeSlice[element] = update.size
 
-				// 총 요소 수 업데이트
-				if i.windowStart+relativeIndex >= i.totalElements {
-					i.totalElements = i.windowStart + relativeIndex + 1
-				}
 			}
 
-			// 변경사항 저장
-			err := i.saveWindow()
-			if err != nil {
-				return err
-			}
 		}
 	}
 
 	// 블룸 필터 업데이트
-	for _, element := range userSet.elements {
+	for _, element := range userSet.Elements {
 		i.totalBloomFilter.Add(element)
+		i.totalElements++
 		i.multiBloomFilter.Add(element)
 	}
 
@@ -781,20 +484,7 @@ func (i *IncrementalUnionFindProcessor) findRoot(element uint64) uint64 {
 
 	// 루트 찾기
 	for {
-		chunkIndex := int(current / ChunkSize)
-		start := uint64(chunkIndex) * ChunkSize
-		end := start + ChunkSize
-
-		// 청크 데이터 로드
-		if i.windowStart != start || i.windowEnd != end {
-			err := i.loadWindow(start, end)
-			if err != nil {
-				return current // 오류 시 현재 요소 반환
-			}
-		}
-
-		relativeIndex := current - start
-		parent := i.parentSlice[relativeIndex]
+		parent := i.parentSlice[current]
 
 		// 자기 자신이 부모이면 루트 찾음
 		if parent == current {
@@ -811,129 +501,150 @@ func (i *IncrementalUnionFindProcessor) findRoot(element uint64) uint64 {
 
 	// 경로 압축 - 모든 요소의 부모를 루트로 설정
 	for _, element := range path {
-		chunkIndex := int(element / ChunkSize)
-		start := uint64(chunkIndex) * ChunkSize
-		end := start + ChunkSize
-
-		// 청크 데이터 로드
-		if i.windowStart != start || i.windowEnd != end {
-			err := i.loadWindow(start, end)
-			if err != nil {
-				continue // 오류 시 다음 요소로
-			}
-		}
-
-		relativeIndex := element - start
-		i.parentSlice[relativeIndex] = root
-
-		// 변경사항 저장
-		i.saveWindow()
+		i.parentSlice[element] = root
 	}
 
 	return root
 }
 
-// mmap 관련 헬퍼 함수
-func (i *IncrementalUnionFindProcessor) loadWindow(start uint64, end uint64) error {
+// ! 참고: 이거 시스템콜이라 더럽게 비쌈. 대략 0.1초 걸림. 엄청 신중히 쓸 것.
+// ! 아님 차라리 element로드를 조금씩 하고, 1억번마다 한번씩 cleanup하던지.
+// 윈도우 관리 함수 - 특정 범위의 메모리를 활성화하고 나머지는 해제
+func (i *IncrementalUnionFindProcessor) tidyWindow(start uint64, end uint64) error {
 	// 윈도우 범위가 파일 용량을 초과하면 파일 확장
 	if end > i.fileCapacity {
 		err := i.extendFiles(end)
 		if err != nil {
-			return err
+			return fmt.Errorf("파일 확장 실패: %w", err)
 		}
 	}
 
-	windowSize := end - start
+	// 이전 윈도우 범위 저장
 
-	// 슬라이스 초기화
-	i.parentSlice = make([]uint64, windowSize)
-	i.rankSlice = make([]uint8, windowSize)
-	i.sizeSlice = make([]uint16, windowSize)
+	// 총 파일 용량
+	totalCapacity := i.fileCapacity
 
-	// null값(초기화되지 않은 값) 체크 플래그
-	foundNullValue := false
+	// 현재 윈도우 외 영역 계산 (앞부분)
+	if start > 0 {
+		// 부모 슬라이스 앞부분 메모리 해제
+		frontParentLength := start * 8 // uint64 = 8바이트
+		if err := madviseBytes(i.parentArchive[:frontParentLength], false); err != nil {
+			return fmt.Errorf("부모 슬라이스 앞부분 madvise 실패: %w", err)
+		}
 
-	// parent 슬라이스 로드
-	for j := uint64(0); j < windowSize && !foundNullValue; j++ {
-		elementIndex := start + j
+		// 랭크 슬라이스 앞부분 메모리 해제
+		frontRankLength := start // uint8 = 1바이트
+		if err := madviseBytes(i.rankArchive[:frontRankLength], false); err != nil {
+			return fmt.Errorf("랭크 슬라이스 앞부분 madvise 실패: %w", err)
+		}
 
-		if elementIndex*8+8 <= uint64(len(i.parentArchive)) {
-			value := binary.LittleEndian.Uint64(i.parentArchive[elementIndex*8 : elementIndex*8+8])
-			if value == 0 {
-				// null값(0)이 나오면 순회 중단
-				foundNullValue = true
-			}
-			i.parentSlice[j] = value
-		} else {
-			i.parentSlice[j] = 0
+		// 크기 슬라이스 앞부분 메모리 해제
+		frontSizeLength := start * 2 // uint16 = 2바이트
+		if err := madviseBytes(i.sizeArchive[:frontSizeLength], false); err != nil {
+			return fmt.Errorf("크기 슬라이스 앞부분 madvise 실패: %w", err)
 		}
 	}
 
-	// rank 슬라이스 로드
-	for j := uint64(0); j < windowSize && !foundNullValue; j++ {
-		elementIndex := start + j
+	// 현재 윈도우 외 영역 계산 (뒷부분)
+	if end < totalCapacity {
+		// 부모 슬라이스 뒷부분 메모리 해제
+		backParentOffset := end * 8 // uint64 = 8바이트
+		backParentLength := (totalCapacity - end) * 8
+		if err := madviseBytes(i.parentArchive[backParentOffset:backParentOffset+backParentLength], false); err != nil {
+			return fmt.Errorf("부모 슬라이스 뒷부분 madvise 실패: %w", err)
+		}
 
-		if elementIndex < uint64(len(i.rankArchive)) {
-			i.rankSlice[j] = i.rankArchive[elementIndex]
-		} else {
-			i.rankSlice[j] = 0
+		// 랭크 슬라이스 뒷부분 메모리 해제
+		backRankOffset := end // uint8 = 1바이트
+		backRankLength := totalCapacity - end
+		if err := madviseBytes(i.rankArchive[backRankOffset:backRankOffset+backRankLength], false); err != nil {
+			return fmt.Errorf("랭크 슬라이스 뒷부분 madvise 실패: %w", err)
+		}
+
+		// 크기 슬라이스 뒷부분 메모리 해제
+		backSizeOffset := end * 2 // uint16 = 2바이트
+		backSizeLength := (totalCapacity - end) * 2
+		if err := madviseBytes(i.sizeArchive[backSizeOffset:backSizeOffset+backSizeLength], false); err != nil {
+			return fmt.Errorf("크기 슬라이스 뒷부분 madvise 실패: %w", err)
 		}
 	}
 
-	// size 슬라이스 로드
-	for j := uint64(0); j < windowSize && !foundNullValue; j++ {
-		elementIndex := start + j
-
-		if elementIndex*2+2 <= uint64(len(i.sizeArchive)) {
-			i.sizeSlice[j] = binary.LittleEndian.Uint16(i.sizeArchive[elementIndex*2 : elementIndex*2+2])
-		} else {
-			i.sizeSlice[j] = 0
-		}
+	// 현재 윈도우 영역은 필요함을 표시
+	// 부모 슬라이스 메모리 확보
+	parentStartOffset := start * 8 // uint64 = 8바이트
+	parentEnd := end * 8
+	if err := madviseBytes(i.parentArchive[parentStartOffset:parentEnd], true); err != nil {
+		return fmt.Errorf("부모 슬라이스 윈도우 madvise 실패: %w", err)
 	}
 
-	// 윈도우 범위 업데이트
-	i.windowStart = start
-	i.windowEnd = end
+	// 랭크 슬라이스 메모리 확보
+	rankStartOffset := start // uint8 = 1바이트
+	rankEnd := end
+	if err := madviseBytes(i.rankArchive[rankStartOffset:rankEnd], true); err != nil {
+		return fmt.Errorf("랭크 슬라이스 윈도우 madvise 실패: %w", err)
+	}
+
+	// 크기 슬라이스 메모리 확보
+	sizeStartOffset := start * 2 // uint16 = 2바이트
+	sizeEnd := end * 2
+	if err := madviseBytes(i.sizeArchive[sizeStartOffset:sizeEnd], true); err != nil {
+		return fmt.Errorf("크기 슬라이스 윈도우 madvise 실패: %w", err)
+	}
 
 	return nil
 }
 
-func (i *IncrementalUnionFindProcessor) saveWindow() error {
-	windowSize := i.windowEnd - i.windowStart
+// Cleanup 함수 - 현재 윈도우를 기준으로 tidyWindow 실행
+func (i *IncrementalUnionFindProcessor) Cleanup() error {
+	fmt.Println("[Cleanup] tidyWindow triggered due to load threshold")
+	i.currentHoldingElements = 0
+	return i.tidyWindow(0, 0)
+}
 
-	// parent 슬라이스 저장
-	for j := uint64(0); j < windowSize; j++ {
-		if i.parentSlice[j] != 0 {
-			elementIndex := i.windowStart + j
-			binary.LittleEndian.PutUint64(i.parentArchive[elementIndex*8:elementIndex*8+8], i.parentSlice[j])
-
-			// 총 원소 수 업데이트
-			if elementIndex >= i.totalElements {
-				i.totalElements = elementIndex + 1
-			}
-		}
+// madvise 래퍼 함수 - 운영체제에 메모리 사용 힌트 제공
+func madviseBytes(b []byte, needed bool) error {
+	// 바이트 슬라이스가 비어있으면 아무것도 하지 않음
+	if len(b) == 0 {
+		return nil
 	}
 
-	// rank 슬라이스 저장
-	for j := uint64(0); j < windowSize; j++ {
-		if i.parentSlice[j] != 0 {
-			elementIndex := i.windowStart + j
-			i.rankArchive[elementIndex] = i.rankSlice[j]
-		}
+	const (
+		// Linux/WSL2 시스템 콜 상수
+		MADV_NORMAL     = 0
+		MADV_WILLNEED   = 3
+		MADV_DONTNEED   = 4
+		MADV_SEQUENTIAL = 2 // 순차적 접근 패턴
+	)
+
+	// 슬라이스 시작 주소와 길이 얻기
+	addr := uintptr(unsafe.Pointer(&b[0]))
+	length := uintptr(len(b))
+
+	// 필요 여부에 따라 어드바이스 설정
+	advice := MADV_DONTNEED
+	if needed {
+		advice = MADV_WILLNEED
 	}
 
-	// size 슬라이스 저장
-	for j := uint64(0); j < windowSize; j++ {
-		if i.parentSlice[j] != 0 {
-			elementIndex := i.windowStart + j
-			binary.LittleEndian.PutUint16(i.sizeArchive[elementIndex*2:elementIndex*2+2], i.sizeSlice[j])
-		}
+	// 시스템 콜 호출
+	_, _, err := syscall.Syscall(
+		syscall.SYS_MADVISE,
+		addr,
+		length,
+		uintptr(advice),
+	)
+
+	// 시스템 콜 오류 확인
+	if err != 0 {
+		return fmt.Errorf("madvise failed: %v", err)
 	}
 
 	return nil
 }
 
 // 파일 확장 헬퍼 함수
+
+// 파일 확장 함수 - reflect.SliceHeader 업데이트 포함
 func (i *IncrementalUnionFindProcessor) extendFiles(newCapacity uint64) error {
 	// 기존 mmap 해제
 	if i.parentArchive != nil {
@@ -949,66 +660,113 @@ func (i *IncrementalUnionFindProcessor) extendFiles(newCapacity uint64) error {
 	// 파일 크기 확장
 	err := i.parentFile.Truncate(int64(newCapacity * 8)) // uint64 = 8바이트
 	if err != nil {
-		return err
+		return fmt.Errorf("부모 파일 확장 실패: %w", err)
 	}
 
 	err = i.rankFile.Truncate(int64(newCapacity)) // uint8 = 1바이트
 	if err != nil {
-		return err
+		return fmt.Errorf("랭크 파일 확장 실패: %w", err)
 	}
 
 	err = i.sizeFile.Truncate(int64(newCapacity * 2)) // uint16 = 2바이트
 	if err != nil {
-		return err
+		return fmt.Errorf("크기 파일 확장 실패: %w", err)
 	}
 
 	// 새로운 mmap 생성
 	parentArchive, err := mmap.Map(i.parentFile, mmap.RDWR, 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("부모 파일 재매핑 실패: %w", err)
 	}
 	i.parentArchive = parentArchive
 
 	rankArchive, err := mmap.Map(i.rankFile, mmap.RDWR, 0)
 	if err != nil {
-		return err
+		i.parentArchive.Unmap()
+		return fmt.Errorf("랭크 파일 재매핑 실패: %w", err)
 	}
 	i.rankArchive = rankArchive
 
 	sizeArchive, err := mmap.Map(i.sizeFile, mmap.RDWR, 0)
 	if err != nil {
-		return err
+		i.parentArchive.Unmap()
+		i.rankArchive.Unmap()
+		return fmt.Errorf("크기 파일 재매핑 실패: %w", err)
 	}
 	i.sizeArchive = sizeArchive
+
+	// 슬라이스 헤더 업데이트
+	{
+		i.parentSlice = unsafe.Slice((*uint64)(unsafe.Pointer(&parentArchive[0])), int(newCapacity))
+		i.rankSlice = unsafe.Slice((*uint8)(unsafe.Pointer(&rankArchive[0])), int(newCapacity))
+		i.sizeSlice = unsafe.Slice((*uint16)(unsafe.Pointer(&sizeArchive[0])), int(newCapacity))
+
+	}
 
 	// 파일 용량 업데이트
 	i.fileCapacity = newCapacity
 
+	// GC 강제 실행으로 메모리 정리
+	runtime.GC()
+
 	return nil
 }
 
-// 블룸 필터 메서드 구현
-func (bf *BloomFilter) Add(element uint64) {
-	for i := uint64(0); i < bf.hashFunctions; i++ {
-		// 간단한 해시 함수
-		hash := (element + i*0x517cc1b727220a95) % bf.size
-		index := hash / 64
-		bit := hash % 64
-		bf.bf[index] |= (1 << bit)
+func (i *IncrementalUnionFindProcessor) accessParent(element uint64) uint64 {
+	i.currentHoldingElements++
+	if i.currentHoldingElements > MaxLoadStack {
+		_ = i.Cleanup()
+
 	}
+	// 바로 슬라이스 인덱스로 접근
+	return i.parentSlice[element]
+}
+func (i *IncrementalUnionFindProcessor) setParent(element uint64, parent uint64) {
+	// 바로 슬라이스 인덱스로 접근하여 값 설정
+	i.parentSlice[element] = parent
 }
 
-func (bf *BloomFilter) MayContain(element uint64) bool {
-	for i := uint64(0); i < bf.hashFunctions; i++ {
-		// 간단한 해시 함수
-		hash := (element + i*0x517cc1b727220a95) % bf.size
-		index := hash / 64
-		bit := hash % 64
-		if (bf.bf[index] & (1 << bit)) == 0 {
-			return false
-		}
+func (i *IncrementalUnionFindProcessor) accessRank(element uint64) uint8 {
+	i.currentHoldingElements++
+	if i.currentHoldingElements > MaxLoadStack {
+		_ = i.Cleanup()
+
 	}
-	return true
+	// 바로 슬라이스 인덱스로 접근
+	return i.rankSlice[element]
+}
+func (i *IncrementalUnionFindProcessor) setRank(element uint64, rank uint8) {
+	// 바로 슬라이스 인덱스로 접근하여 값 설정
+	i.rankSlice[element] = rank
+}
+func (i *IncrementalUnionFindProcessor) accessSize(element uint64) uint16 {
+	i.currentHoldingElements++
+	if i.currentHoldingElements > MaxLoadStack {
+		_ = i.Cleanup()
+	}
+	// 바로 슬라이스 인덱스로 접근
+	return i.sizeSlice[element]
+}
+func (i *IncrementalUnionFindProcessor) setSize(element uint64, size uint16) {
+	// 바로 슬라이스 인덱스로 접근하여 값 설정
+	i.sizeSlice[element] = size
+}
+
+// 참고: 복사 방식이 아닌 포인터 방식으로 요소 접근 예시
+func (i *IncrementalUnionFindProcessor) accessElement(element uint64) (uint64, uint8, uint16) {
+	i.currentHoldingElements++
+	if i.currentHoldingElements > MaxLoadStack {
+		_ = i.Cleanup()
+
+	}
+	// 바로 슬라이스 인덱스로 접근
+	return i.parentSlice[element], i.rankSlice[element], i.sizeSlice[element]
+}
+func (i *IncrementalUnionFindProcessor) setElement(element uint64, parent uint64, rank uint8, size uint16) {
+	// 바로 슬라이스 인덱스로 접근하여 값 설정
+	i.parentSlice[element] = parent
+	i.rankSlice[element] = rank
+	i.sizeSlice[element] = size
 }
 
 // NewDisjointSet은 새로운 DisjointSet 인스턴스를 생성합니다.
@@ -1099,12 +857,50 @@ func (ds *DisjointSet) PrintSets() {
 	}
 }
 
+// 대용량 파일 생성
+func createLargeFile(fileName string, size int64) (*os.File, error) {
+	// 디렉토리 확인 및 생성
+	dir := filepath.Dir(fileName)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("디렉토리 생성 실패: %v", err)
+	}
+
+	// 파일 생성
+	f, err := os.OpenFile(fileName, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("파일 생성 실패: %v", err)
+	}
+
+	fmt.Printf("파일 생성 중: %s (%.2f GB)\n", fileName, float64(size)/1024/1024/1024)
+
+	// 파일 크기 설정
+	err = f.Truncate(size)
+	if err != nil {
+		// truncate 실패 시 sparse 파일로 대체
+		fmt.Printf("Truncate 실패, sparse 파일로 시도: %v\n", err)
+		_, seekErr := f.Seek(size-1, 0)
+		if seekErr != nil {
+			f.Close()
+			return nil, seekErr
+		}
+		_, writeErr := f.Write([]byte{0})
+		if writeErr != nil {
+			f.Close()
+			return nil, writeErr
+		}
+	}
+
+	return f, nil
+}
+
 // 생성자 함수
 func NewIncrementalUnionFindProcessor(dataDir string, initialCapacity uint64) (*IncrementalUnionFindProcessor, error) {
 	// 디렉토리 생성
+
+	// 디렉토리 생성
 	err := os.MkdirAll(dataDir, 0755)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("데이터 디렉토리 생성 실패: %w", err)
 	}
 
 	// 파일 경로
@@ -1112,98 +908,455 @@ func NewIncrementalUnionFindProcessor(dataDir string, initialCapacity uint64) (*
 	rankFilePath := filepath.Join(dataDir, "rank.bin")
 	sizeFilePath := filepath.Join(dataDir, "size.bin")
 
-	// 파일 열기
-	parentFile, err := os.OpenFile(parentFilePath, os.O_RDWR|os.O_CREATE, 0644)
+	// 대용량 파일 한번에 생성
+	parentSize := int64(initialCapacity * 8) // uint64 = 8바이트
+	parentFile, err := createLargeFile(parentFilePath, parentSize)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("부모 파일 생성 실패: %w", err)
 	}
+	defer parentFile.Close()
 
-	rankFile, err := os.OpenFile(rankFilePath, os.O_RDWR|os.O_CREATE, 0644)
+	rankSize := int64(initialCapacity) // uint8 = 1바이트
+	rankFile, err := createLargeFile(rankFilePath, rankSize)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("랭크 파일 생성 실패: %w", err)
 	}
+	defer rankFile.Close()
 
-	sizeFile, err := os.OpenFile(sizeFilePath, os.O_RDWR|os.O_CREATE, 0644)
+	sizeSize := int64(initialCapacity * 2) // uint16 = 2바이트
+	sizeFile, err := createLargeFile(sizeFilePath, sizeSize)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("크기 파일 생성 실패: %w", err)
 	}
-
-	// 파일 크기 확인
-	parentInfo, err := parentFile.Stat()
-	if err != nil {
-		return nil, err
-	}
-
-	fileCapacity := uint64(parentInfo.Size()) / 8 // uint64 = 8바이트
-
-	// 필요시 파일 크기 확장
-	if fileCapacity < initialCapacity {
-		err = parentFile.Truncate(int64(initialCapacity * 8))
-		if err != nil {
-			return nil, err
-		}
-
-		err = rankFile.Truncate(int64(initialCapacity))
-		if err != nil {
-			return nil, err
-		}
-
-		err = sizeFile.Truncate(int64(initialCapacity * 2))
-		if err != nil {
-			return nil, err
-		}
-
-		fileCapacity = initialCapacity
-	}
+	defer sizeFile.Close()
 
 	// mmap 생성
 	parentArchive, err := mmap.Map(parentFile, mmap.RDWR, 0)
 	if err != nil {
-		return nil, err
+		parentFile.Close()
+		rankFile.Close()
+		sizeFile.Close()
+		return nil, fmt.Errorf("부모 파일 메모리 매핑 실패: %w", err)
 	}
 
 	rankArchive, err := mmap.Map(rankFile, mmap.RDWR, 0)
 	if err != nil {
-		return nil, err
+		parentArchive.Unmap()
+		parentFile.Close()
+		rankFile.Close()
+		sizeFile.Close()
+		return nil, fmt.Errorf("랭크 파일 메모리 매핑 실패: %w", err)
 	}
 
 	sizeArchive, err := mmap.Map(sizeFile, mmap.RDWR, 0)
 	if err != nil {
-		return nil, err
+		parentArchive.Unmap()
+		rankArchive.Unmap()
+		parentFile.Close()
+		rankFile.Close()
+		sizeFile.Close()
+		return nil, fmt.Errorf("크기 파일 메모리 매핑 실패: %w", err)
 	}
+	// 슬라이스 변수 선언
+	var parentSlice []uint64
+	var rankSlice []uint8
+	var sizeSlice []uint16
 
-	// 블룸 필터 생성 (오탐률 0.5% 정도로 설정)
-	totalBloomFilterSize := uint64(4_000_000_000 * 10 / 8) // 약 5GB
-	multiBloomFilterSize := totalBloomFilterSize / 10      // 약 500MB
+	// 메모리 맵을 Go 슬라이스로 직접 재해석
+	{
+		parentSlice = unsafe.Slice((*uint64)(unsafe.Pointer(&parentArchive[0])), int(initialCapacity))
+		rankSlice = unsafe.Slice((*uint8)(unsafe.Pointer(&rankArchive[0])), int(initialCapacity))
+		sizeSlice = unsafe.Slice((*uint16)(unsafe.Pointer(&sizeArchive[0])), int(initialCapacity))
 
-	totalBloomFilter := &BloomFilter{
-		size:          totalBloomFilterSize * 8, // 비트 단위 크기
-		bf:            make([]uint64, totalBloomFilterSize),
-		hashFunctions: 8,
 	}
+	totalBloomFilter := NewBloomFilter(4_000_000_000, 0.005) //
 
-	multiBloomFilter := &BloomFilter{
-		size:          multiBloomFilterSize * 8, // 비트 단위 크기
-		bf:            make([]uint64, multiBloomFilterSize),
-		hashFunctions: 8,
-	}
+	multiBloomFilter := NewBloomFilter(2_000_000_000, 0.005)
 
 	return &IncrementalUnionFindProcessor{
-		dataDir:          dataDir,
-		parentFile:       parentFile,
-		rankFile:         rankFile,
-		sizeFile:         sizeFile,
-		parentArchive:    parentArchive,
-		rankArchive:      rankArchive,
-		sizeArchive:      sizeArchive,
-		parentSlice:      nil,
-		rankSlice:        nil,
-		sizeSlice:        nil,
-		windowStart:      0,
-		windowEnd:        0,
-		totalBloomFilter: totalBloomFilter,
-		multiBloomFilter: multiBloomFilter,
-		totalElements:    0,
-		fileCapacity:     fileCapacity,
+		dataDir:                dataDir,
+		parentFile:             parentFile,
+		rankFile:               rankFile,
+		sizeFile:               sizeFile,
+		parentArchive:          parentArchive,
+		rankArchive:            rankArchive,
+		sizeArchive:            sizeArchive,
+		parentSlice:            parentSlice,
+		rankSlice:              rankSlice,
+		sizeSlice:              sizeSlice,
+		currentHoldingElements: 0,
+		totalBloomFilter:       totalBloomFilter,
+		multiBloomFilter:       multiBloomFilter,
+		totalElements:          0,
+		fileCapacity:           initialCapacity,
 	}, nil
 }
+
+// 결과 조회 함수: 특정 요소의 루트 찾기
+func (i *IncrementalUnionFindProcessor) Find(element uint64) (uint64, error) {
+	// element가 존재하는지 블룸 필터로 확인
+	if !i.totalBloomFilter.MayContain(element) {
+		return 0, fmt.Errorf("요소가 존재하지 않음: %d", element)
+	}
+
+	// 요소가 존재하는 청크 찾기
+
+	// 요소가 실제로 존재하는지 확인
+	if i.parentSlice[element] == 0 {
+		return 0, fmt.Errorf("요소가 존재하지 않음: %d", element)
+	}
+
+	// 루트 찾기
+	return i.findRoot(element), nil
+}
+
+// 결과 조회 함수: 특정 요소가 속한 집합의 크기 찾기
+func (i *IncrementalUnionFindProcessor) Size(element uint64) (uint16, error) {
+	// 요소의 루트 찾기
+	root, err := i.Find(element)
+	if err != nil {
+		return 0, err
+	}
+
+	// 루트 요소의 크기 반환
+	return i.sizeSlice[root], nil
+}
+
+// 자원 해제 함수
+func (i *IncrementalUnionFindProcessor) Close() error {
+	if i.parentArchive != nil {
+		if err := i.parentArchive.Unmap(); err != nil {
+			return fmt.Errorf("부모 매핑 해제 실패: %w", err)
+		}
+	}
+
+	if i.rankArchive != nil {
+		if err := i.rankArchive.Unmap(); err != nil {
+			return fmt.Errorf("랭크 매핑 해제 실패: %w", err)
+		}
+	}
+
+	if i.sizeArchive != nil {
+		if err := i.sizeArchive.Unmap(); err != nil {
+			return fmt.Errorf("크기 매핑 해제 실패: %w", err)
+		}
+	}
+
+	if i.parentFile != nil {
+		if err := i.parentFile.Close(); err != nil {
+			return fmt.Errorf("부모 파일 닫기 실패: %w", err)
+		}
+	}
+
+	if i.rankFile != nil {
+		if err := i.rankFile.Close(); err != nil {
+			return fmt.Errorf("랭크 파일 닫기 실패: %w", err)
+		}
+	}
+
+	if i.sizeFile != nil {
+		if err := i.sizeFile.Close(); err != nil {
+			return fmt.Errorf("크기 파일 닫기 실패: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// 두 요소가 같은 집합에 속하는지 확인
+func (i *IncrementalUnionFindProcessor) Connected(element1 uint64, element2 uint64) (bool, error) {
+	// 각 요소의 루트 찾기
+	root1, err := i.Find(element1)
+	if err != nil {
+		return false, err
+	}
+
+	root2, err := i.Find(element2)
+	if err != nil {
+		return false, err
+	}
+
+	// 루트가 같으면 연결됨
+	return root1 == root2, nil
+}
+
+//TODO 더 나은 접근법 찾기. parent기반이 최선이긴 한데
+//TODO 이 겨웅 순차 로드로 한다거나.
+// // 특정 요소가 속한 집합의 모든 요소 가져오기 (주의: 매우 비효율적, 큰 집합에는 사용 금지)
+// func (i *IncrementalUnionFindProcessor) GetSet(element uint64) ([]uint64, error) {
+// 	// 요소의 루트 찾기
+// 	root, err := i.Find(element)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	// 집합 크기 확인
+// 	size, err := i.Size(root)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	// 결과 집합 초기화
+// 	result := make([]uint64, 0, size)
+
+// 	// 전체 요소 수 확인
+// 	maxElement := i.totalElements
+
+// 	// 모든 요소를 청크 단위로 확인
+// 	for startIdx := uint64(0); startIdx < maxElement; startIdx += ChunkSize {
+// 		endIdx := startIdx + ChunkSize
+// 		if endIdx > maxElement {
+// 			endIdx = maxElement
+// 		}
+
+// 		// 청크 내 모든 요소 확인
+// 		for j := uint64(0); j < endIdx-startIdx; j++ {
+// 			if i.parentSlice[j] != 0 {
+// 				// 이 요소의 루트 찾기
+// 				elementRoot := i.findRoot(startIdx + j)
+// 				if elementRoot == root {
+// 					result = append(result, startIdx+j)
+// 				}
+// 			}
+// 		}
+// 	}
+
+// 	return result, nil
+// }
+
+// func (i *IncrementalUnionFindProcessor) ProcessMultiSets(userSets []UserSet) error {
+// 	// 해당 함수는 크기가 2이상은 집합들을 IncrementalUnionFindProcessor의 아카이브에 반영한다.
+// 	if len(userSets) == 0 {
+// 		return nil
+// 	}
+
+// 	// 1. 우선 메모리 내에서, DisjointSet구조체를 이용해서 빠르게 유니언 파인드를 처리
+// 	ds := NewDisjointSet()
+
+// 	// 모든 요소를 DisjointSet에 추가하고 같은 셋끼리 유니언
+// 	for _, userSet := range userSets {
+// 		if len(userSet.Elements) < 2 {
+// 			continue
+// 		}
+
+// 		root := userSet.Elements[0]
+// 		ds.MakeSet(root)
+
+// 		for _, element := range userSet.Elements[1:] {
+// 			ds.MakeSet(element)
+// 			ds.Union(root, element)
+// 		}
+// 	}
+// 	println("자체 disjointSet 연산 완료")
+// 	disjointSets := ds.GetSets()
+// 	println("자체 disjointSet 획득 완료")
+// 	println(len(disjointSets), "개의 disjointSet 획득")
+
+// 	// 1-1. disjointSets 구하기
+
+// 	// SetWithAnchor 구조체 정의
+// 	type SetWithAnchor struct {
+// 		anchorToRoot map[uint64]uint64
+// 		set          []uint64
+// 	}
+
+// 	// 각 분리 집합 처리
+// 	for _, elements := range disjointSets {
+// 		// 2-1. 앵커 후보 찾기 - multiBloomFilter에 있는 요소들
+// 		maybeAnchor := []uint64{}
+// 		for _, element := range elements {
+// 			if i.multiBloomFilter.MayContain(element) {
+// 				maybeAnchor = append(maybeAnchor, element)
+// 			}
+// 		}
+
+// 		// 2-1. 청크별로 분류
+// 		maybeAnchorByChunk := ParseByChunk(maybeAnchor)
+
+// 		// 3. 실제 앵커 확인 및 루트 찾기
+// 		anchorToRoot := make(map[uint64]uint64)
+
+// 		for chunkIndex, anchors := range maybeAnchorByChunk {
+// 			// 청크 경계 계산
+// 			start := uint64(chunkIndex) * ChunkSize
+// 			end := start + ChunkSize
+
+// 			// 청크 데이터 로드
+// 			if i.windowStart != start || i.windowEnd != end {
+// 				err := i.loadWindow(start, end)
+// 				if err != nil {
+// 					return err
+// 				}
+// 			}
+
+// 			// 각 앵커 확인
+// 			for _, anchor := range anchors {
+// 				// 상대적 인덱스 계산
+// 				relativeIndex := anchor - start
+
+// 				// 실제 존재하는 요소인지 확인
+// 				if i.parentSlice[relativeIndex] != 0 {
+// 					// 3-1. 루트 찾기
+// 					root := i.findRoot(anchor)
+// 					anchorToRoot[anchor] = root
+// 				}
+// 			}
+// 		}
+
+// 		// SetWithAnchor 생성
+// 		swa := SetWithAnchor{
+// 			anchorToRoot: anchorToRoot,
+// 			set:          elements,
+// 		}
+
+// 		// 4. 앵커 상황에 따른 처리
+// 		if len(swa.anchorToRoot) == 0 {
+// 			// 4-1. 앵커가 없는 경우: 새 집합 추가
+// 			newSet := UserSet{
+// 				Size:     uint16(len(swa.set)),
+// 				Elements: swa.set,
+// 			}
+
+// 			// 새로운 다중 집합 일괄 추가
+// 			err := i.BatchAddMultiSet([]UserSet{newSet})
+// 			if err != nil {
+// 				return err
+// 			}
+// 		} else if len(swa.anchorToRoot) == 1 {
+// 			// 4-2. 앵커가 하나인 경우: 기존 집합 확장
+
+// 			var root uint64
+
+// 			// 유일한 앵커와 루트 가져오기
+// 			for _, r := range swa.anchorToRoot {
+// 				root = r
+// 				break
+// 			}
+
+// 			// UserSet 생성
+// 			newSet := UserSet{
+// 				Size:     uint16(len(swa.set)),
+// 				Elements: swa.set,
+// 			}
+
+// 			// 집합 확장
+// 			err := i.GrowMultiSet(newSet, root)
+// 			if err != nil {
+// 				return err
+// 			}
+// 		} else {
+// 			// 4-3. 앵커가 여러 개인 경우: 집합 병합
+// 			newSet := UserSet{
+// 				Size:     uint16(len(swa.set)),
+// 				Elements: swa.set,
+// 			}
+
+// 			// 여러 집합 병합
+// 			err := i.MergeMultiSet(newSet, swa.anchorToRoot)
+// 			if err != nil {
+// 				return err
+// 			}
+// 		}
+
+// 		// 4-4. 블룸 필터 업데이트
+// 		for _, element := range elements {
+// 			i.totalBloomFilter.Add(element)
+// 			i.multiBloomFilter.Add(element)
+// 		}
+// 	}
+
+//		return nil
+//	}
+
+// // mmap 관련 헬퍼 함수
+// func (i *IncrementalUnionFindProcessor) loadWindow(start uint64, end uint64) error {
+// 	// 윈도우 범위가 파일 용량을 초과하면 파일 확장
+// 	if end > i.fileCapacity {
+// 		err := i.extendFiles(end)
+// 		if err != nil {
+// 			return err
+// 		}
+// 	}
+
+// 	windowSize := end - start
+// 	// 이전 슬라이스 해제를 유도하기 위해 nil 설정``
+// 	i.parentSlice = nil
+// 	i.rankSlice = nil
+// 	i.sizeSlice = nil
+// 	runtime.GC()
+
+// 	// 슬라이스 초기화
+// 	i.parentSlice = make([]uint64, windowSize)
+// 	i.rankSlice = make([]uint8, windowSize)
+// 	i.sizeSlice = make([]uint16, windowSize)
+
+// 	// parent 슬라이스 로드
+// 	for j := uint64(0); j < windowSize; j++ {
+// 		elementIndex := start + j
+
+// 		if elementIndex*8+8 <= uint64(len(i.parentArchive)) {
+// 			value := binary.LittleEndian.Uint64(i.parentArchive[elementIndex*8 : elementIndex*8+8])
+// 			i.parentSlice[j] = value
+// 		} else {
+// 			i.parentSlice[j] = 0
+// 		}
+// 	}
+
+// 	// rank 슬라이스 로드
+// 	for j := uint64(0); j < windowSize; j++ {
+// 		elementIndex := start + j
+
+// 		if elementIndex < uint64(len(i.rankArchive)) {
+// 			i.rankSlice[j] = i.rankArchive[elementIndex]
+// 		} else {
+// 			i.rankSlice[j] = 0
+// 		}
+// 	}
+
+// 	// size 슬라이스 로드
+// 	for j := uint64(0); j < windowSize; j++ {
+// 		elementIndex := start + j
+
+// 		if elementIndex*2+2 <= uint64(len(i.sizeArchive)) {
+// 			i.sizeSlice[j] = binary.LittleEndian.Uint16(i.sizeArchive[elementIndex*2 : elementIndex*2+2])
+// 		} else {
+// 			i.sizeSlice[j] = 0
+// 		}
+// 	}
+
+// 	// 윈도우 범위 업데이트
+// 	i.windowStart = start
+// 	i.windowEnd = end
+
+// 	return nil
+// }
+
+// func (i *IncrementalUnionFindProcessor) saveWindow() error {
+// 	windowSize := i.windowEnd - i.windowStart
+
+// 	// parent 슬라이스 저장
+// 	for j := uint64(0); j < windowSize; j++ {
+// 		if i.parentSlice[j] != 0 {
+// 			elementIndex := i.windowStart + j
+// 			binary.LittleEndian.PutUint64(i.parentArchive[elementIndex*8:elementIndex*8+8], i.parentSlice[j])
+// 		}
+// 	}
+
+// 	// rank 슬라이스 저장
+// 	for j := uint64(0); j < windowSize; j++ {
+// 		if i.parentSlice[j] != 0 {
+// 			elementIndex := i.windowStart + j
+// 			i.rankArchive[elementIndex] = i.rankSlice[j]
+// 		}
+// 	}
+
+// 	// size 슬라이스 저장
+// 	for j := uint64(0); j < windowSize; j++ {
+// 		if i.parentSlice[j] != 0 {
+// 			elementIndex := i.windowStart + j
+// 			binary.LittleEndian.PutUint16(i.sizeArchive[elementIndex*2:elementIndex*2+2], i.sizeSlice[j])
+// 		}
+// 	}
+
+// 	return nil
+// }
