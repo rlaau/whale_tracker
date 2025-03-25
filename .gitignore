@@ -26,6 +26,7 @@ build/
 *.gob
 *.prof
 utils/data
+utils/pipes/extracTx/data
 
 # 내 json파일
 whaletracker-453817-e1587ebfd400.json
