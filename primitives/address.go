@@ -1,13 +1,71 @@
 package primitives
 
 import (
+	"bufio"
 	"encoding/hex"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
 )
 
+var CexAddressSet map[Address]struct{}
+
 func init() {
-	// 그냥 DB에서 깡으로 로드
-	// 가장 최신 기준
-	// PredifnedADddress
+	CexAddressSet = make(map[Address]struct{})
+
+	sourcePath := GetProjectRoot()
+	cexFilePath := filepath.Join(sourcePath, "/primitives/cex.txt")
+
+	file, err := os.Open(cexFilePath)
+	if err != nil {
+		log.Fatalf("cex.txt 파일을 열 수 없습니다: %v", err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		addrBytes, err := decodeHexAddress(line)
+		if err != nil {
+			log.Printf("주소 디코딩 실패: %s (%v)", line, err)
+			continue
+		}
+
+		CexAddressSet[addrBytes] = struct{}{}
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Fatalf("cex.txt 파일 읽기 오류: %v", err)
+	}
+
+	log.Printf("✅ CEX 주소 %d개 로드 완료\n", len(CexAddressSet))
+}
+
+func decodeHexAddress(s string) (Address, error) {
+	var b Address
+
+	// 0x 접두어 제거
+	s = strings.ToLower(strings.TrimPrefix(s, "0x"))
+
+	decoded, err := hex.DecodeString(s)
+	if err != nil || len(decoded) != 20 {
+		return b, err
+	}
+	copy(b[:], decoded)
+	return b, nil
+}
+
+func SetCexAddress(addr Address) {
+	CexAddressSet[addr] = struct{}{}
+}
+
+func IsCexAddress(addr Address) bool {
+	_, exists := CexAddressSet[addr]
+	return exists
 }
 
 type Address [20]byte
