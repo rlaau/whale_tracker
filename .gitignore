@@ -25,3 +25,6 @@ build/
 *.dat
 *.gob
 utils/data
+
+# 내 json파일
+whaletracker-453817-e1587ebfd400.json
