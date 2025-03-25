@@ -24,6 +24,7 @@ build/
 *.bin
 *.dat
 *.gob
+*.prof
 utils/data
 
 # 내 json파일

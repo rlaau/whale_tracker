@@ -96,6 +96,42 @@ func printMemoryUsage(stage string, stats MemoryStats) {
 	fmt.Println()
 }
 
+// createLargeFile: 지정된 크기의 파일 생성
+func createLargeFile(fileName string, size int64) (*os.File, error) {
+	// 디렉토리 확인 및 생성
+	dir := filepath.Dir(fileName)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("디렉토리 생성 실패: %v", err)
+	}
+
+	// 파일 생성/오픈
+	f, err := os.OpenFile(fileName, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("파일 생성 실패: %v", err)
+	}
+
+	fmt.Printf("파일 생성 중: %s (%.2f MB)\n", fileName, float64(size)/1024/1024)
+
+	// 파일 크기 설정
+	err = f.Truncate(size)
+	if err != nil {
+		// truncate 실패 시 sparse 파일로 대체
+		fmt.Printf("Truncate 실패, sparse 파일로 시도: %v\n", err)
+		_, seekErr := f.Seek(size-1, 0)
+		if seekErr != nil {
+			f.Close()
+			return nil, seekErr
+		}
+		_, writeErr := f.Write([]byte{0})
+		if writeErr != nil {
+			f.Close()
+			return nil, writeErr
+		}
+	}
+
+	return f, nil
+}
+
 // 새 MMapUnionFind 생성
 func NewMMapUnionFind(batchID int, numElements int, dataDir string) (*MMapUnionFind, error) {
 	// 결과 구조체 초기화
